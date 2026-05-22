@@ -12,20 +12,22 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 TOP_K        = 8
 MIN_SIM      = 0.3
 
-_MODEL = None
+CF_ACCOUNT_ID = os.environ["CF_ACCOUNT_ID"]
+CF_AI_TOKEN   = os.environ["CF_AI_TOKEN"]
+CF_EMBED_URL  = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/baai/bge-base-en-v1.5"
 
 def _embed(text: str) -> list[float]:
-    global _MODEL
-    if _MODEL is None:
-        from sentence_transformers import SentenceTransformer
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        _MODEL = SentenceTransformer("BAAI/bge-base-en-v1.5", device=device)
-    return _MODEL.encode(
-        [f"Represent this sentence: {text}"],
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-    )[0].tolist()
+    r = requests.post(
+        CF_EMBED_URL,
+        headers={"Authorization": f"Bearer {CF_AI_TOKEN}"},
+        json={"text": [f"Represent this sentence: {text}"]},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["result"]["data"][0]
+
+def warmup():
+    print("Embedder ready (Cloudflare AI).")
 
 def _h():
     return {
