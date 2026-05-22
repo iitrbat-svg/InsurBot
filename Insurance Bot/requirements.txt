@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+sentence-transformers
+torch
+requests
+python-dotenv
+langchain
+langchain-google-genai
+langsmith
+pydantic
