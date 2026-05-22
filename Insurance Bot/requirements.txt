@@ -1,7 +1,5 @@
 fastapi
 uvicorn
-sentence-transformers
-torch
 requests
 python-dotenv
 langchain
