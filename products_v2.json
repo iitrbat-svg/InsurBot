@@ -1,0 +1,43 @@
+[
+  {"id": "star_comprehensive", "insurer": "Star Health", "product_slug": "Star Comprehensive", "insurer_folder": "Star Health and Allied Insurance", "product_folder": "Star Comprehensive", "results_folder": "Star Comprehensive"},
+  {"id": "star_smart_health_pro", "insurer": "Star Health", "product_slug": "Star Smart Health Pro", "insurer_folder": "Star Health and Allied Insurance", "product_folder": "Star Smart Health Pro", "results_folder": "Star Smart Health Pro"},
+  {"id": "star_super_star", "insurer": "Star Health", "product_slug": "Star Super Star", "insurer_folder": "Star Health and Allied Insurance", "product_folder": "Star Super Star", "results_folder": "Star Super Star"},
+  {"id": "star_senior_red_carpet", "insurer": "Star Health", "product_slug": "Star Senior Citizens Red Carpet", "insurer_folder": "Star Health and Allied Insurance", "product_folder": "Senior Citizens Red Carpet", "results_folder": "Senior Citizens Red Carpet"},
+  {"id": "star_family_health_optima", "insurer": "Star Health", "product_slug": "Star Family Health Optima", "insurer_folder": "Star Health and Allied Insurance", "product_folder": "Family Health Optima", "results_folder": "Family Health Optima"},
+  {"id": "star_diabetes_safe", "insurer": "Star Health", "product_slug": "Star Diabetes Safe", "insurer_folder": "Star Health and Allied Insurance", "product_folder": "Diabetes Safe", "results_folder": "Diabetes Safe"},
+
+  {"id": "niva_reassure3", "insurer": "Niva Bupa", "product_slug": "ReAssure 3.0", "insurer_folder": "Niva Bupa", "product_folder": "ReAssure 3.0", "results_folder": "ReAssure 3.0"},
+  {"id": "niva_health_premia", "insurer": "Niva Bupa", "product_slug": "Health Premia", "insurer_folder": "Niva Bupa", "product_folder": "Health Premia", "results_folder": "Health Premia"},
+  {"id": "niva_health_companion", "insurer": "Niva Bupa", "product_slug": "Health Companion", "insurer_folder": "Niva Bupa", "product_folder": "Health Companion", "results_folder": "Health Companion"},
+  {"id": "niva_senior_first", "insurer": "Niva Bupa", "product_slug": "Senior First", "insurer_folder": "Niva Bupa", "product_folder": "Senior First", "results_folder": "Senior First"},
+
+  {"id": "care_supreme", "insurer": "Care Health", "product_slug": "Care Supreme", "insurer_folder": "Care Health Insurance", "product_folder": "Care Supreme", "results_folder": "Care_Supreme"},
+  {"id": "care_supreme_senior", "insurer": "Care Health", "product_slug": "Care Supreme Senior", "insurer_folder": "Care Health Insurance", "product_folder": "Care Supreme Senior", "results_folder": "Care Supreme Senior"},
+  {"id": "care_advantage", "insurer": "Care Health", "product_slug": "Care Advantage", "insurer_folder": "Care Health Insurance", "product_folder": "Care Advantage", "results_folder": "Care Advantage"},
+  {"id": "care_heart", "insurer": "Care Health", "product_slug": "Care Heart", "insurer_folder": "Care Health Insurance", "product_folder": "Care Heart", "results_folder": "Care Heart"},
+  {"id": "care_plus", "insurer": "Care Health", "product_slug": "Care Plus", "insurer_folder": "Care Health Insurance", "product_folder": "Care Plus", "results_folder": "Care Plus"},
+
+  {"id": "hdfc_optima_secure", "insurer": "HDFC ERGO", "product_slug": "Optima Secure", "insurer_folder": "HDFC ERGO", "product_folder": "Optima Secure", "results_folder": "Optima Secure"},
+  {"id": "hdfc_optima_restore", "insurer": "HDFC ERGO", "product_slug": "Optima Restore", "insurer_folder": "HDFC ERGO", "product_folder": "Optima Restore", "results_folder": "Optima Restore"},
+  {"id": "hdfc_my_health_suraksha", "insurer": "HDFC ERGO", "product_slug": "My Health Suraksha", "insurer_folder": "HDFC ERGO", "product_folder": "My Health Suraksha", "results_folder": "My Health Suraksha"},
+  {"id": "hdfc_energy", "insurer": "HDFC ERGO", "product_slug": "HDFC Energy", "insurer_folder": "HDFC ERGO", "product_folder": "Energy", "results_folder": "Energy"},
+
+  {"id": "icici_elevate", "insurer": "ICICI Lombard", "product_slug": "Elevate", "insurer_folder": "ICICI Lombard", "product_folder": "Elevate", "results_folder": "Elevate"},
+  {"id": "icici_health_advantedge", "insurer": "ICICI Lombard", "product_slug": "Health AdvantEdge", "insurer_folder": "ICICI Lombard", "product_folder": "Health AdvantEdge", "results_folder": "Health AdvantEdge"},
+  {"id": "icici_complete_health", "insurer": "ICICI Lombard", "product_slug": "Complete Health Insurance", "insurer_folder": "ICICI Lombard", "product_folder": "Complete Health Insurance", "results_folder": "Complete Health Insurance"},
+
+  {"id": "bajaj_health_guard", "insurer": "Bajaj Allianz", "product_slug": "Health Guard", "insurer_folder": "Bajaj Allianz", "product_folder": "Health Guard", "results_folder": "Health Guard"},
+  {"id": "bajaj_my_health_care", "insurer": "Bajaj Allianz", "product_slug": "My Health Care", "insurer_folder": "Bajaj Allianz", "product_folder": "My Health Care", "results_folder": "My Health Care"},
+  {"id": "bajaj_health_infinity", "insurer": "Bajaj Allianz", "product_slug": "Health Infinity", "insurer_folder": "Bajaj Allianz", "product_folder": "Health Infinity", "results_folder": "Health Infinity"},
+  {"id": "bajaj_extra_care_plus", "insurer": "Bajaj Allianz", "product_slug": "Extra Care Plus", "insurer_folder": "Bajaj Allianz", "product_folder": "Extra Care Plus", "results_folder": "Extra Care Plus"},
+
+  {"id": "aditya_activ_one_max", "insurer": "Aditya Birla Health", "product_slug": "Activ One MAX", "insurer_folder": "Aditya Birla Health", "product_folder": "Activ One MAX", "results_folder": "Activ One MAX"},
+  {"id": "aditya_activ_one_nxt", "insurer": "Aditya Birla Health", "product_slug": "Activ One NXT", "insurer_folder": "Aditya Birla Health", "product_folder": "Activ One NXT", "results_folder": "Activ One NXT"},
+  {"id": "aditya_activ_health_platinum", "insurer": "Aditya Birla Health", "product_slug": "Activ Health Platinum Enhanced", "insurer_folder": "Aditya Birla Health", "product_folder": "Activ Health Platinum Enhanced", "results_folder": "Activ Health Platinum Enhanced"},
+  {"id": "aditya_activ_care_classic", "insurer": "Aditya Birla Health", "product_slug": "Activ Care Classic", "insurer_folder": "Aditya Birla Health", "product_folder": "Activ Care Classic", "results_folder": "Activ Care Classic"},
+
+  {"id": "newindia_floater_mediclaim", "insurer": "New India Assurance", "product_slug": "New India Floater Mediclaim", "insurer_folder": "New India Assurance", "product_folder": "New India Floater Mediclaim", "results_folder": "New India Floater Mediclaim"},
+  {"id": "newindia_premier_mediclaim", "insurer": "New India Assurance", "product_slug": "New India Premier Mediclaim", "insurer_folder": "New India Assurance", "product_folder": "New India Premier Mediclaim", "results_folder": "New India Premier Mediclaim"},
+  {"id": "newindia_asha_kiran", "insurer": "New India Assurance", "product_slug": "New India Asha Kiran", "insurer_folder": "New India Assurance", "product_folder": "Asha Kiran", "results_folder": "Asha Kiran"},
+  {"id": "newindia_arogya_sanjeevani", "insurer": "New India Assurance", "product_slug": "New India Arogya Sanjeevani", "insurer_folder": "New India Assurance", "product_folder": "New India Arogya Sanjeevani", "results_folder": "New India Arogya Sanjeevani"}
+]
