@@ -169,7 +169,14 @@ Be concise but complete."""
         "recommendation": """
 Rank the policies from best to worst fit for the user's profile.
 For each policy explain: (1) why it fits or doesn't, (2) key benefit,
-(3) main concern. End with a clear top recommendation with reasoning.""",
+(3) main concern. End with a clear top recommendation with reasoning.
+IMPORTANT: If the user's condition falls under 'specified disease waiting period'
+(gall bladder, hernia, cataract, knee replacement etc.), explicitly state the
+waiting period for EACH policy. If ALL policies have the same waiting period,
+clearly say so upfront — do not imply any policy is better on this dimension.
+For each policy state: waiting period for the specific condition, cashless
+network size, premium range, and any sub-limits.
+End with a clear recommendation based on overall value, not just the condition.""",
 
         "comparison": """
 Compare policies side by side on the specific parameters asked.
