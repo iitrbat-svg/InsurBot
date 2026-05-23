@@ -235,6 +235,25 @@ def _fallback_all(limit: int) -> dict:
         "sql_params":      {},
     }
 
+#── Post-filter: remove policies where user age is below minimum entry age ───────
+if filters.get("age"):
+    age = filters["age"]
+    # Fetch min_entry_age for candidates
+    ids = [c["id"] for c in candidates]
+    if ids:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/policies"
+            f"?id=in.({','.join(ids)})"
+            f"&select=id,min_entry_age",
+            headers=_h(), timeout=10)
+        if r.ok:
+            min_ages = {row["id"]: row.get("min_entry_age", 0) for row in r.json()}
+            candidates = [
+                c for c in candidates
+                if min_ages.get(c["id"], 0) <= age
+            ]
+
+
 
 # ── Fetch single policy ────────────────────────────────────────────────────────
 
