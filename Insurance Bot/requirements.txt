@@ -1,8 +1,0 @@
-fastapi
-uvicorn
-requests
-python-dotenv
-langchain
-langchain-google-genai
-langsmith
-pydantic
