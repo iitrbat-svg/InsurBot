@@ -1,16 +1,17 @@
-"""STEP 4: Router Agent"""
+"""
+Router — judgment-based, 4 retrieval decisions instead of 12 rigid intents.
+"""
 import os, json, re
 from dotenv import load_dotenv
-
-load_dotenv()
-os.environ.setdefault("LANGCHAIN_TRACING_V2","true")
-os.environ.setdefault("LANGCHAIN_PROJECT","insurance-intel")
-
 from langchain_core.prompts      import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_google_genai      import ChatGoogleGenerativeAI
 import requests as _req
 from pathlib import Path
+
+load_dotenv()
+os.environ.setdefault("LANGCHAIN_TRACING_V2","true")
+os.environ.setdefault("LANGCHAIN_PROJECT","insurance-intel")
 
 GEMINI_CANDIDATES = [(k,m) for k,m in [
     (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash"),
@@ -23,116 +24,110 @@ GEMINI_CANDIDATES = [(k,m) for k,m in [
     (os.getenv("GEMINI_KEY_3"),   "gemini-2.0-flash"),
 ] if k]
 
-CORPUS = json.loads(Path("products_v2.json").read_text()) if Path("products_v2.json").exists() else []
+CORPUS      = json.loads(Path("products_v2.json").read_text()) if Path("products_v2.json").exists() else []
 CORPUS_LIST = "\n".join(f"  {p['insurer']}: {p['product_slug']} (id: {p['id']})" for p in CORPUS)
 
-SPECIFIED_DISEASES = [
-    "gall bladder","bile duct","gallstone","kidney stone","calculi","hernia",
-    "cataract","knee replacement","joint replacement","tonsil","adenoid",
-    "hysterectomy","benign tumor","benign tumour","varicose vein","piles",
-    "fissure","fistula","hydrocele","sinusitis","spinal disc","prolapse disc",
-    "pilonidal","mastoid","prostate hypertrophy","gastric ulcer","duodenal ulcer",
-    "osteoarthritis","osteoporosis",
-]
-ACUTE_ILLNESSES = [
-    "jaundice","dengue","typhoid","malaria","fever","appendicitis","fracture",
-    "accident","injury","pneumonia","infection","flu","covid","viral","bacterial",
-    "food poisoning","diarrhea","vomiting","stroke","heart attack","emergency",
-]
-
 ROUTER_SYSTEM = """You are routing queries for an Indian health insurance advisor.
+Your job: understand what the user needs, decide how to retrieve the answer, extract key information.
 
-AVAILABLE POLICIES:
+AVAILABLE POLICIES IN OUR DATABASE:
 {corpus_list}
 
-CONVERSATION SUMMARY:
+CONVERSATION CONTEXT:
 {summary}
 
-Return ONLY valid JSON. No markdown.
+Return ONLY valid JSON. No markdown, no explanation.
 
 {{
-  "intent": <see intents below>,
-  "policies_mentioned": [<policy ids from corpus>],
-  "insurer_mentioned": <insurer name or null>,
-  "not_in_corpus": [<policy names not in corpus>],
+  "retrieval_decision": <ONE of: "NO_RETRIEVAL" | "SQL_ONLY" | "RAG" | "FC">,
+  "intent_description": <one sentence describing what user wants — used to guide the synthesizer>,
+  "policies_mentioned": [<exact policy ids from corpus if user named specific policies>],
+  "insurer_mentioned":  <insurer name if user named insurer but not specific product, else null>,
+  "not_in_corpus":      [<policy names user mentioned NOT in our database>],
   "filters": {{
-    "age": <int or null>,
-    "budget_yearly_inr": <int or null — convert "15k"→15000>,
+    "age":                <int or null>,
+    "budget_yearly_inr":  <int or null — convert "15k"→15000, "1.5L"→150000>,
     "budget_monthly_inr": <int or null>,
-    "si_min_lakhs": <float or null>,
-    "conditions": [<medical conditions lowercase>],
-    "maternity_needed": <bool or null>,
-    "no_copay": <bool or null>,
+    "si_min_lakhs":       <float or null>,
+    "conditions":         [<medical conditions lowercase, e.g. "diabetes","jaundice","gall bladder stone">],
+    "maternity_needed":   <bool or null>,
+    "no_copay":           <bool or null>,
     "no_room_rent_limit": <bool or null>,
-    "opd_needed": <bool or null>,
-    "restore_needed": <bool or null>,
-    "senior_citizen": <bool or null>,
-    "city_tier": <"A"/"B"/"C" or null>
+    "opd_needed":         <bool or null>,
+    "restore_needed":     <bool or null>,
+    "senior_citizen":     <bool or null — true if age >= 60>,
+    "city_tier":          <"A"/"B"/"C" or null>
   }},
-  "section_tags": [<from: waiting_period,exclusions,sub_limits,maternity,ncb_restore,claims_process,premium_table,definitions,general_coverage>],
-  "specific_question": <precise retrieval question — never use vague phrases like "key features". For conditions always ask specifically about waiting periods, coverage terms, exclusions.
-  CONDITION CLASSIFICATION — include in specific_question:
-  - Acute illness (jaundice,dengue,typhoid,fever,appendicitis,fracture,emergency): ask about "general hospitalization coverage and initial 30-day waiting period"
-  - Specified disease (gall bladder,hernia,cataract,kidney stone,knee replacement): ask about "specific disease waiting period"
-  - Pre-existing (diabetes,hypertension,cardiac): ask about "PED waiting period and coverage terms">,
-  "needs_clarification": <bool>,
-  "clarification_question": <string or null>,
-  "is_followup": <bool>,
-  "resolved_policy_ids": [<policy ids from prior context if followup>],
-  "retrieval_mode": <"full_context"/"rag_filtered"/"sql_only"/"llm_only"/"ask_user">,
-  "confidence": <"high"/"medium"/"low">
+  "section_tags": [<relevant tags: waiting_period | exclusions | sub_limits | maternity |
+                    ncb_restore | claims_process | premium_table | general_coverage | definitions>],
+  "specific_question":    <precise retrieval question — specific enough to match policy clauses.
+                           NEVER use vague phrases like "key features" or "tell me about".
+                           Always ask for specific terms: waiting periods, limits, exclusions, amounts.
+                           For conditions: classify first, then ask accordingly —
+                           ACUTE (jaundice/dengue/typhoid/fever/appendicitis/fracture/emergency/infection):
+                             ask "What is covered under general hospitalization after 30-day initial wait?"
+                           SPECIFIED DISEASE (gall bladder/hernia/cataract/kidney stone/knee replacement/
+                             varicose vein/piles/hydrocele/sinusitis/spinal disc/benign tumor/hysterectomy):
+                             ask "What is the specified disease waiting period for [condition]?"
+                           PRE-EXISTING (diabetes/hypertension/cardiac/declared conditions):
+                             ask "What is the PED waiting period and coverage terms for [condition]?">,
+  "needs_clarification":  <bool — true ONLY if query is genuinely too vague to answer at all>,
+  "clarification_question": <one targeted question if needs_clarification, else null>,
+  "is_followup":          <bool — true if references prior context like "that plan","the first one","it">,
+  "resolved_policy_ids":  [<if followup, policy ids from prior context>]
 }}
 
-INTENTS:
-  single_policy_detail — one specific policy, specific question
-  comparison           — 2-4 named policies compared
-  recommendation       — user profile given, find best policy
-  corpus_search        — search across all policies for a feature
-  condition_specific   — condition across multiple policies
-  premium_lookup       — cost/premium question → sql_only
-  eligibility_check    — age/entry conditions → sql_only
-  claims_process       — how to file a claim
-  evaluation           — is this policy good/suitable
-  general_knowledge    — insurance concepts, no retrieval → llm_only
-  missing_docs         — policy not in corpus → ask_user
-  clarification_needed — too vague → ask_user
-  followup             — references prior conversation
+RETRIEVAL DECISION RULES — use judgment, not rigid matching:
 
-RETRIEVAL MODE:
-  single_policy_detail/comparison/evaluation → full_context
-  recommendation/condition_specific/corpus_search → rag_filtered
-  premium_lookup/eligibility_check → sql_only
-  general_knowledge → llm_only
-  missing_docs/clarification_needed → ask_user
+NO_RETRIEVAL: Query answerable from general knowledge or the corpus list alone.
+  Examples: "what is a waiting period", "how does NCB work", "what is co-payment",
+  "what policies do you have", "what insurers are covered", "tell me about all policies",
+  "what is health insurance", "explain restore benefit", "what is TPA".
+  Use this whenever no specific policy clause lookup is needed.
 
-EVALUATION RULE: "is X good/worth it/suitable?" with no profile → needs_clarification=true.
-With profile → section_tags=all 6 sections, comprehensive specific_question.
+SQL_ONLY: Needs structured fields from policies table only — no document text needed.
+  Examples: "which policies allow entry at age 68", "cheapest policy for 30yr 5L SI",
+  "which plans have no copay", "policies with max SI above 1Cr", "which cover maternity".
+  Use when the answer comes from policy metadata fields, not from clause text.
 
-VAGUE QUESTION RULE: specific_question must never contain "key features","overview","tell me about","information about". Always ask for specific terms."""
+RAG: Needs specific clause text from policy documents.
+  Examples: "what is the maternity waiting period in Care Supreme", 
+  "which plans cover OPD from day 1", "what are the exclusions in HDFC Optima",
+  "I am 36 with jaundice which policy covers me", "best plan for diabetic 35yr budget 15k",
+  "compare room rent across all policies", "which plans cover gall bladder surgery".
+  Use for most specific coverage questions, recommendations, condition-specific queries.
+
+FC (Full Context): User named 1-4 specific policies AND needs deep analysis.
+  Examples: "compare Star Comprehensive vs Care Supreme on maternity",
+  "evaluate HDFC Optima Secure for my profile", "what does Activ One MAX cover for cardiac",
+  "is Niva Bupa ReAssure 3.0 worth buying for a 40yr diabetic".
+  Use ONLY when specific named policies need detailed document-level analysis.
+
+SECTION TAG GUIDANCE:
+  Condition questions        → waiting_period + relevant tag
+  Exclusion questions        → exclusions
+  Limit/sub-limit questions  → sub_limits
+  Maternity questions        → maternity + waiting_period
+  Claim questions            → claims_process
+  Premium/cost questions     → premium_table
+  NCB/restore questions      → ncb_restore
+  General coverage           → general_coverage
+
+CLARIFICATION: Only ask for clarification if the query has NO extractable information.
+  "Which is the best policy?" → needs_clarification=true (no profile at all)
+  "I am 36 with jaundice, best policy?" → needs_clarification=false (enough info to answer)
+  "Is this policy good?" with no policy named → needs_clarification=true"""
 
 ROUTER_HUMAN = "User message: {message}"
 
-VALID_INTENTS = {
-    "single_policy_detail","comparison","recommendation","corpus_search",
-    "condition_specific","premium_lookup","eligibility_check","claims_process",
-    "evaluation","general_knowledge","missing_docs","clarification_needed","followup",
-}
-VALID_MODES   = {"full_context","rag_filtered","sql_only","llm_only","ask_user"}
-VALID_TAGS    = {"waiting_period","exclusions","sub_limits","maternity","ncb_restore",
-                 "claims_process","premium_table","definitions","general_coverage","other"}
-INTENT_MODE   = {
-    "single_policy_detail":"full_context","comparison":"full_context",
-    "recommendation":"rag_filtered","corpus_search":"rag_filtered",
-    "condition_specific":"rag_filtered","premium_lookup":"sql_only",
-    "eligibility_check":"sql_only","claims_process":"rag_filtered",
-    "evaluation":"rag_filtered","general_knowledge":"llm_only",
-    "missing_docs":"ask_user","clarification_needed":"ask_user","followup":"rag_filtered",
-}
-EVAL_TAGS = ["waiting_period","exclusions","sub_limits","general_coverage","ncb_restore","maternity"]
+VALID_DECISIONS = {"NO_RETRIEVAL","SQL_ONLY","RAG","FC"}
+VALID_TAGS      = {"waiting_period","exclusions","sub_limits","maternity","ncb_restore",
+                   "claims_process","premium_table","definitions","general_coverage","other"}
 
 def _make_chain(key, model):
     prompt = ChatPromptTemplate.from_messages([("system",ROUTER_SYSTEM),("human",ROUTER_HUMAN)])
-    llm    = ChatGoogleGenerativeAI(model=model, google_api_key=key, temperature=0, max_output_tokens=1024)
+    llm    = ChatGoogleGenerativeAI(model=model, google_api_key=key,
+                                    temperature=0, max_output_tokens=1024)
     return prompt | llm | StrOutputParser()
 
 def _parse(raw):
@@ -143,9 +138,8 @@ def _parse(raw):
     return json.loads(raw[s:e+1])
 
 def _validate(r, message):
-    if r.get("intent") not in VALID_INTENTS: r["intent"] = "clarification_needed"
-    intent = r["intent"]
-    if r.get("retrieval_mode") not in VALID_MODES: r["retrieval_mode"] = INTENT_MODE.get(intent,"rag_filtered")
+    if r.get("retrieval_decision") not in VALID_DECISIONS:
+        r["retrieval_decision"] = "RAG"
     r.setdefault("policies_mentioned",[])
     r.setdefault("not_in_corpus",[])
     r.setdefault("section_tags",[])
@@ -154,114 +148,104 @@ def _validate(r, message):
     r.setdefault("needs_clarification",False)
     r.setdefault("clarification_question",None)
     r.setdefault("is_followup",False)
-    r.setdefault("confidence","medium")
     r.setdefault("insurer_mentioned",None)
+    r.setdefault("intent_description","")
     r["specific_question"] = r.get("specific_question") or message
-    r["section_tags"] = [t for t in r["section_tags"] if t in VALID_TAGS]
+    r["section_tags"]      = [t for t in r.get("section_tags",[]) if t in VALID_TAGS]
 
-    # Condition classification — override section_tags and specific_question
-    conditions = [c.lower() for c in (r.get("filters",{}).get("conditions") or [])]
-    if conditions:
-        joined = " ".join(conditions)
-        if any(d in joined for d in SPECIFIED_DISEASES):
-            if "waiting_period" not in r["section_tags"]: r["section_tags"].insert(0,"waiting_period")
-            if "sub_limits"     not in r["section_tags"]: r["section_tags"].append("sub_limits")
-        elif any(d in joined for d in ACUTE_ILLNESSES):
-            r["section_tags"]       = ["general_coverage","claims_process"]
-            r["specific_question"]  = ("What is covered under general hospitalization and acute illness? "
-                                       "What is the initial 30-day waiting period and cashless facility?")
+    # FC requires named policies — downgrade to RAG if none
+    if r["retrieval_decision"] == "FC" and not r["policies_mentioned"]:
+        r["retrieval_decision"] = "RAG"
 
-    # Evaluation rules
-    if intent == "evaluation":
-        f = r.get("filters",{})
-        if not any([f.get("age"),f.get("budget_yearly_inr"),f.get("conditions")]):
-            r["needs_clarification"]    = True
-            pids = r.get("policies_mentioned",[])
-            pname = pids[0].replace("_"," ").title() if pids else "this policy"
-            r["clarification_question"] = (f"To evaluate if {pname} suits you, could you share "
-                                           f"your age, any health conditions, and annual budget?")
-        else:
-            r["section_tags"]       = EVAL_TAGS
-            r["retrieval_mode"]     = "rag_filtered"
-            pids  = r.get("policies_mentioned",[])
-            pname = pids[0].replace("_"," ").title() if pids else "this policy"
-            r["specific_question"]  = (f"What are the waiting periods, exclusions, sub-limits, "
-                                       f"room rent, co-payment, restore benefit, NCB of {pname}?")
+    # not_in_corpus only → flag it
+    if r.get("not_in_corpus") and not r.get("policies_mentioned"):
+        r["retrieval_decision"]  = "NO_RETRIEVAL"
+        r["_missing_from_corpus"] = True
 
-    # Comparison → single if only 1 policy
-    if intent == "comparison" and len(r["policies_mentioned"]) == 1:
-        r["intent"] = "single_policy_detail"; r["retrieval_mode"] = "full_context"
-
-    # Recommendation with no filters → clarify
-    if intent == "recommendation" and not any(v for v in r.get("filters",{}).values() if v is not None):
+    # No filters at all + RAG → might need clarification for recommendation
+    filters = r.get("filters",{})
+    is_recommendation = any(w in message.lower() for w in
+                            ["best","recommend","suggest","which policy","should i buy"])
+    if is_recommendation and not any(v for v in filters.values() if v is not None):
         r["needs_clarification"]    = True
         r["clarification_question"] = ("Could you share your age, approximate annual budget, "
-                                       "and any health conditions?")
-
-    # not_in_corpus only → missing_docs
-    if r.get("not_in_corpus") and not r.get("policies_mentioned"):
-        r["intent"] = "missing_docs"; r["retrieval_mode"] = "ask_user"
+                                       "and any health conditions? That'll help me find the best match.")
 
     # Vague question guard
     q = r.get("specific_question","")
-    if any(p in q.lower() for p in ["key features","overview","tell me about","information about"]):
-        r["specific_question"] = q + " Include waiting periods, exclusions, sub-limits, room rent, co-payment."
-
+    vague = ["key features","overview","tell me about","information about","details about"]
+    if any(p in q.lower() for p in vague):
+        r["specific_question"] = q + (" — specifically: waiting periods, "
+                                      "exclusions, sub-limits, room rent limit, co-payment.")
     return r
 
 def _fallback(message, error):
-    return {"intent":"clarification_needed","retrieval_mode":"ask_user",
-            "policies_mentioned":[],"not_in_corpus":[],"filters":{},
-            "section_tags":[],"specific_question":message,
-            "needs_clarification":True,
-            "clarification_question":"I'm having trouble processing that. Could you rephrase?",
-            "is_followup":False,"resolved_policy_ids":[],"confidence":"low","_error":error}
+    return {
+        "retrieval_decision":    "RAG",
+        "intent_description":    message,
+        "policies_mentioned":    [],
+        "not_in_corpus":         [],
+        "filters":               {},
+        "section_tags":          [],
+        "specific_question":     message,
+        "needs_clarification":   False,
+        "clarification_question": None,
+        "is_followup":           False,
+        "resolved_policy_ids":   [],
+        "_error":                str(error),
+    }
 
 def route(message, summary="", conversation_history=None):
-    eff_summary = summary or "No prior conversation."
+    eff = summary or "No prior conversation."
     if conversation_history:
         recent  = conversation_history[-2:]
-        eff_summary += "\n\nRecent:\n" + "\n".join(f"{m['role'].upper()}: {m['content'][:200]}" for m in recent)
-    inputs = {"corpus_list":CORPUS_LIST,"summary":eff_summary,"message":message}
+        eff    += "\n\nRecent:\n" + "\n".join(
+            f"{m['role'].upper()}: {m['content'][:200]}" for m in recent)
+    inputs   = {"corpus_list":CORPUS_LIST,"summary":eff,"message":message}
     last_err = None
     for key, model_name in GEMINI_CANDIDATES:
         try:
-            raw    = _make_chain(key, model_name).invoke(inputs)
+            raw    = _make_chain(key,model_name).invoke(inputs)
             result = _parse(raw)
             return _validate(result, message)
         except Exception as e:
             last_err = e; continue
-    return _fallback(message, str(last_err))
+    return _fallback(message, last_err)
 
 def resolve_policy_name(name):
     url,key = os.environ.get("SUPABASE_URL",""), os.environ.get("SUPABASE_KEY","")
     if not url or not key: return []
     r = _req.post(f"{url}/rest/v1/rpc/resolve_policy_name",
-                  headers={"apikey":key,"Authorization":f"Bearer {key}","Content-Type":"application/json"},
-                  json={"query_name":name}, timeout=10)
+        headers={"apikey":key,"Authorization":f"Bearer {key}","Content-Type":"application/json"},
+        json={"query_name":name}, timeout=10)
     return r.json() if r.ok else []
 
 if __name__ == "__main__":
     import sys
     TESTS = [
-        "Is Activ One MAX a good policy?",
+        "Tell me about all health insurance policies in India",
+        "What is a waiting period?",
         "I am 36 with jaundice, which policy covers me from year 1 with cashless?",
         "I am 36, have gall bladder stone, which policy covers surgery from year 1?",
         "I am 34, diabetic, budget 15k/year. Best policy?",
         "Compare HDFC Optima Secure vs Niva Bupa ReAssure on room rent",
         "Which plans have no room rent limit?",
-        "What is a waiting period?",
+        "Is Activ One MAX a good policy?",
+        "Is Activ One MAX good for me? I am 42, cardiac history, budget 25k",
         "How to file cashless claim with Star Health?",
+        "Which is the best policy?",
     ]
     queries = [sys.argv[1]] if len(sys.argv)>1 else TESTS
     print("="*65)
     for q in queries:
         r = route(q)
         print(f"\nQ: {q}")
-        print(f"  intent:    {r['intent']}")
-        print(f"  mode:      {r['retrieval_mode']}")
-        print(f"  tags:      {r['section_tags']}")
-        print(f"  question:  {(r.get('specific_question') or '')[:100]}")
-        print(f"  filters:   {r['filters']}")
-        if r.get("needs_clarification"): print(f"  clarify:   {r['clarification_question']}")
+        print(f"  decision:    {r['retrieval_decision']}")
+        print(f"  intent:      {r['intent_description']}")
+        print(f"  tags:        {r['section_tags']}")
+        print(f"  question:    {(r.get('specific_question') or '')[:100]}")
+        print(f"  policies:    {r['policies_mentioned']}")
+        filters = {k:v for k,v in r['filters'].items() if v is not None}
+        if filters: print(f"  filters:     {filters}")
+        if r.get("needs_clarification"): print(f"  clarify:     {r['clarification_question']}")
     print("="*65)
