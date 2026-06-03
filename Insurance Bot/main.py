@@ -216,34 +216,40 @@ async def process_chat(req: ChatRequest):
 
     # Phase B: Intercept with the Premium Underwriting Engine
     if filters.get("age") and pricing_queue:
-        yield f"data: {json.dumps({'type':'trace','text':'Running dynamic calculation tables...'})}\n\n"
+        yield f"data: {json.dumps({'type':'trace','text':f'Running dynamic calculation tables for {len(pricing_queue)} policies...'})}\n\n"
         target_si = filters.get("sum_insured_inr") or 500000
         target_zone = filters.get("zone") or "All"
         
         calculated_quotes = []
         for pid in list(pricing_queue)[:6]:
             quote_res = calculate_quote(pid, int(filters["age"]), requested_si=target_si, zone=target_zone)
-            if quote_res["status"] == "success":
+            if quote_res.get("status") == "success":
                 quote_res["policy_id"] = pid
                 calculated_quotes.append(quote_res)
+            else:
+                # Send the exact failure reason directly to the UI trace window!
+                err_msg = quote_res.get("message", "Unknown DB Error")
+                yield f"data: {json.dumps({'type':'trace','text':f'⚠️ Pricing skipped for {pid}: {err_msg}'})}\n\n"
+                print(f"[DEBUG PRICING ENGINE] {pid} Failed: {err_msg}")
                 
         if calculated_quotes:
             calculated_quotes.sort(key=lambda x: x["final_payable"])
             
             pricing_strings = ["## Real-Time Calculated Quotes & Underwriting Rules"]
             for rank, q in enumerate(calculated_quotes, 1):
-                si_disclaimer = f" **[ATTENTION: {q['si_note']}]**" if q.get("si_note") else ""
+                si_disclaimer = f" **[ATTENTION: {q.get('si_note')}]**" if q.get("si_note") else ""
+                zone_disclaimer = f" **[{q.get('zone_note')}]**" if q.get("zone_note") else ""
                 
                 pricing_strings.append(
                     f"Rank {rank}: Policy ID [{q['policy_id']}]\n"
-                    f" - Input Profile: Age {filters['age']} | Cover Quoted: ₹{q['actual_si_used']:,}{si_disclaimer}\n"
+                    f" - Input Profile: Age {filters['age']} | Cover Quoted: ₹{q.get('actual_si_used', target_si):,}{si_disclaimer}{zone_disclaimer}\n"
                     f" - Baseline Grid Premium: ₹{q['base_premium']:,}\n"
                     f" - Deductions Applied: {q['applied_modifiers'] or 'None'}\n"
                     f" - Net Premium (Excl. Tax): ₹{q['net_premium_before_tax']:,}\n"
                     f" - GST (Statutory 18%): ₹{q['gst_amount']:,}\n"
                     f" - **Final Payable Cost (Inc. Tax): ₹{q['final_payable']:,}**\n"
-                    f" - Available Loadings Structure: {json.dumps(q['all_loadings'])}\n"
-                    f" - Other Available Discount Rules: {json.dumps(q['all_discounts'])}"
+                    f" - Available Loadings Structure: {json.dumps(q.get('all_loadings', []))}\n"
+                    f" - Other Available Discount Rules: {json.dumps(q.get('all_discounts', []))}"
                 )
             context_blocks.insert(0, "\n\n".join(pricing_strings))
             
