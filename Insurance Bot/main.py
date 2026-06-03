@@ -26,7 +26,6 @@ app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["*"],allow_
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
-# Key Rotation Pool
 GEMINI_CANDIDATES = [(k,m) for k,m in [
     (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash"),
     (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash-lite"),
@@ -147,8 +146,9 @@ Answer the user's question accurately based on the factual calculations, policy 
 
 UNIVERSAL RULES:
 1. PRICING & DISCOUNTS: Always present the step-by-step pricing breakdown when quotes are available. Clearly cite the Base Premium, active deductions, and final amount including the statutory 18% GST.
-2. WAITING PERIODS: Distinguish between the 30-day initial wait, 24-month specific disease exclusions, and pre-existing disease (PED) clauses. Acute illnesses are covered after 30 days.
-3. STRUCTURED COMPARISONS: Sort cost evaluations by Rank (Cheapest first). Present tabular outputs for metrics where relevant.
+2. ADJUSTED SUM INSUREDS: If a requested cover amount was unavailable and the system quoted a nearby amount (e.g. 15L instead of 10L), you MUST explicitly tell the user about the adjustment.
+3. WAITING PERIODS: Distinguish between the 30-day initial wait, 24-month specific disease exclusions, and pre-existing disease (PED) clauses.
+4. STRUCTURED COMPARISONS: Sort cost evaluations by Rank (Cheapest first). Present tabular outputs for metrics where relevant.
 
 The user's intent: {intent_description}"""
 
@@ -188,7 +188,6 @@ async def process_chat(req: ChatRequest):
         yield f"data: {json.dumps({'type':'answer','text':msg})}\n\n"
         yield "data: [DONE]\n\n"; return
 
-    # Stitched Processing Context Arrays
     context_blocks = []
     pricing_queue  = set(policies or router_result.get("resolved_policy_ids", []))
 
@@ -204,7 +203,6 @@ async def process_chat(req: ChatRequest):
     elif decision == "FC":
         context_blocks.append(build_fc_context(list(pricing_queue), question, conditions))
     else:
-        # Standard RAG Flow
         has_filters = any(v for k, v in filters.items() if v is not None and k not in ["age", "sum_insured_inr", "zone"])
         search_ids = list(pricing_queue)
         if has_filters and not search_ids:
@@ -224,20 +222,21 @@ async def process_chat(req: ChatRequest):
         
         calculated_quotes = []
         for pid in list(pricing_queue)[:6]:
-            quote_res = calculate_quote(pid, int(filters["age"]), sum_insured=target_si, zone=target_zone)
+            quote_res = calculate_quote(pid, int(filters["age"]), requested_si=target_si, zone=target_zone)
             if quote_res["status"] == "success":
                 quote_res["policy_id"] = pid
                 calculated_quotes.append(quote_res)
                 
         if calculated_quotes:
-            # Enforce ascending cost ordering across extracted profiles
             calculated_quotes.sort(key=lambda x: x["final_payable"])
             
             pricing_strings = ["## Real-Time Calculated Quotes & Underwriting Rules"]
             for rank, q in enumerate(calculated_quotes, 1):
+                si_disclaimer = f" **[ATTENTION: {q['si_note']}]**" if q.get("si_note") else ""
+                
                 pricing_strings.append(
                     f"Rank {rank}: Policy ID [{q['policy_id']}]\n"
-                    f" - Input Profile: Age {filters['age']} | Coverage Level: ₹{target_si:,}\n"
+                    f" - Input Profile: Age {filters['age']} | Cover Quoted: ₹{q['actual_si_used']:,}{si_disclaimer}\n"
                     f" - Baseline Grid Premium: ₹{q['base_premium']:,}\n"
                     f" - Deductions Applied: {q['applied_modifiers'] or 'None'}\n"
                     f" - Net Premium (Excl. Tax): ₹{q['net_premium_before_tax']:,}\n"
@@ -249,12 +248,10 @@ async def process_chat(req: ChatRequest):
             context_blocks.insert(0, "\n\n".join(pricing_strings))
             
         else:
-            # --- THE "NO SILENT FAILURES" TRAP ---
-            # If quotes failed, we inject this warning so the AI can explain the missing data.
             context_blocks.insert(0, (
                 "## SYSTEM PRICING ERROR\n"
                 "You tried to calculate premiums, but the database returned no matching rows "
-                f"for Age {filters['age']} and SI {target_si}. "
+                f"for Age {filters['age']}. "
                 "You MUST apologize to the user and state that you do not have the exact premium "
                 "data for these policies in your database right now, but provide the feature analysis below."
             ))
