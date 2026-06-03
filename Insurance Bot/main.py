@@ -1,5 +1,6 @@
 """FastAPI Backend — Insurance Intel (with Pricing Engine, SQL fallback, and Error Trapping)"""
 import os, json, asyncio
+import concurrent.futures
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,8 +28,8 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
 GEMINI_CANDIDATES = [(k,m) for k,m in [
-    (os.getenv("GEMINI_KEY"),"gemini-2.5-flash"),
-    (os.getenv("GEMINI_KEY"),"gemini-2.5-flash-lite"),
+    (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash"),
+    (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash-lite"),
     (os.getenv("GEMINI_KEY_1"),   "gemini-2.5-flash-lite"),
     (os.getenv("GEMINI_KEY_1"),   "gemini-2.0-flash"),
     (os.getenv("GEMINI_KEY_2"),   "gemini-2.5-flash-lite"),
@@ -186,10 +187,12 @@ async def process_chat(req: ChatRequest):
     context_blocks = []
     pricing_queue  = set(policies or router_result.get("resolved_policy_ids", []))
 
+    # Phase A: Handle Structural Filtering & Catalog Discretion
     if decision == "NO_RETRIEVAL":
         context_blocks.append(f"Available policies in database:\n{CORPUS_LIST}")
     elif decision == "SQL_ONLY" or not pricing_queue:
-        sql_res = sql_filter(filters, "sql", limit=5)
+        # FIX: Increased limit from 5 to 20 to cast a wider net for price sorting!
+        sql_res = sql_filter(filters, "sql", limit=20)
         context_blocks.append(format_sql_context(sql_res))
         for cand in sql_res.get("candidates", []):
             pricing_queue.add(cand["id"])
@@ -200,35 +203,56 @@ async def process_chat(req: ChatRequest):
         has_filters = any(v for k, v in filters.items() if v is not None and k not in ["age", "sum_insured_inr", "zone"])
         search_ids = list(pricing_queue)
         if has_filters and not search_ids:
-            sql_res = sql_filter(filters, "rag", limit=5)
+            # FIX: Increased limit from 5 to 20 here as well!
+            sql_res = sql_filter(filters, "rag", limit=20)
             search_ids = [c["id"] for c in sql_res.get("candidates",[])]
             session["last_candidate_ids"] = search_ids
             for sid in search_ids: pricing_queue.add(sid)
         
-        rag_text = build_rag_context(question, search_ids, section_tags or None, conditions)
+        # Only fetch RAG context for top 5 to save context window tokens
+        rag_text = build_rag_context(question, search_ids[:5], section_tags or None, conditions)
         context_blocks.append(rag_text)
 
+    # Phase B: Intercept with the Premium Underwriting Engine
     if filters.get("age") and pricing_queue:
-        yield f"data: {json.dumps({'type':'trace','text':f'Running dynamic calculation tables for {len(pricing_queue)} policies...'})}\n\n"
+        yield f"data: {json.dumps({'type':'trace','text':f'Calculating quotes in parallel for {len(pricing_queue)} policies...'})}\n\n"
         target_si = filters.get("sum_insured_inr") or 500000
         target_zone = filters.get("zone") or "All"
         
         calculated_quotes = []
-        for pid in list(pricing_queue)[:6]:
-            quote_res = calculate_quote(pid, int(filters["age"]), requested_si=target_si, zone=target_zone)
-            if quote_res.get("status") == "success":
-                quote_res["policy_id"] = pid
-                calculated_quotes.append(quote_res)
-            else:
-                err_msg = quote_res.get("message", "Unknown DB Error")
-                yield f"data: {json.dumps({'type':'trace','text':f'⚠️ Pricing skipped for {pid}: {err_msg}'})}\n\n"
+        
+        # FIX: Define a thread-safe worker to calculate quotes instantly
+        def fetch_quote(pid):
+            try:
+                res = calculate_quote(pid, int(filters["age"]), requested_si=target_si, zone=target_zone)
+                if res.get("status") == "success":
+                    res["policy_id"] = pid
+                    return res
+            except Exception:
+                pass
+            return None
+
+        # PARALLEL EXECUTION: This fixes the time-delay bug! 
+        # Fires 20 calculations at once instead of one by one.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            futures = [executor.submit(fetch_quote, pid) for pid in list(pricing_queue)]
+            for future in concurrent.futures.as_completed(futures):
+                res = future.result()
+                if res:
+                    calculated_quotes.append(res)
                 
         if calculated_quotes:
+            # FIX: Sort the massive list of successful quotes by price!
             calculated_quotes.sort(key=lambda x: x["final_payable"])
-            yield f"data: {json.dumps({'type':'structured_quote', 'data': calculated_quotes})}\n\n"
+            
+            # NOW slice the absolute top 5 cheapest to send to UI
+            top_quotes = calculated_quotes[:5]
+            
+            yield f"data: {json.dumps({'type':'structured_quote', 'data': top_quotes})}\n\n"
+            
             llm_note = (
-                f"SYSTEM NOTE: Successfully calculated and displayed {len(calculated_quotes)} quotes in the UI cards. "
-                f"The cheapest is {calculated_quotes[0]['policy_id']}. "
+                f"SYSTEM NOTE: Successfully calculated and displayed {len(top_quotes)} quotes in the UI cards. "
+                f"The absolute cheapest is {top_quotes[0]['policy_id']}. "
                 f"DO NOT output pricing tables. The UI already shows them. Proceed to compare features directly."
             )
             context_blocks.insert(0, llm_note)
