@@ -89,9 +89,9 @@ CRITICAL PRICING & COMPARISON RULES:
 RETRIEVAL DECISION RULES — use judgment, not rigid matching:
 
 NO_RETRIEVAL: Query answerable from general knowledge or the corpus list alone.
-SQL_ONLY: Needs structured fields from policies table or premium engine checks[cite: 13].
-RAG: Needs specific clause text from policy documents[cite: 13].
-FC (Full Context): User named 1-4 specific policies AND needs deep analysis[cite: 13].
+SQL_ONLY: Needs structured fields from policies table or premium engine checks.
+RAG: Needs specific clause text from policy documents.
+FC (Full Context): User named 1-4 specific policies AND needs deep analysis.
 """
 
 ROUTER_HUMAN = "User message: {message}"
@@ -107,76 +107,5 @@ def _make_chain(key, model):
 
 def _parse(raw):
     raw = raw.strip()
-    if "```" in raw: raw = re.sub(r"
-```(?:json)?","",raw).strip().rstrip("`").strip()
-    s,e = raw.find("{"), raw.rfind("}")
-    if s==-1 or e==-1: raise ValueError(f"No JSON: {raw[:100]}")
-    return json.loads(raw[s:e+1])
-
-def _validate(r, message):
-    if r.get("retrieval_decision") not in VALID_DECISIONS:
-        r["retrieval_decision"] = "RAG"
-    r.setdefault("policies_mentioned",[])
-    r.setdefault("not_in_corpus",[])
-    r.setdefault("section_tags",[])
-    r.setdefault("resolved_policy_ids",[])
-    r.setdefault("filters",{})
-    r.setdefault("needs_clarification",False)
-    r.setdefault("clarification_question",None)
-    r.setdefault("is_followup",False)
-    r.setdefault("insurer_mentioned",None)
-    r.setdefault("intent_description","")
-    r["specific_question"] = r.get("specific_question") or message
-    r["section_tags"]      = [t for t in r.get("section_tags",[]) if t in VALID_TAGS]
-
-    if r["retrieval_decision"] == "FC" and not r["policies_mentioned"]:
-        r["retrieval_decision"] = "RAG"
-
-    if r.get("not_in_corpus") and not r.get("policies_mentioned"):
-        r["retrieval_decision"]  = "NO_RETRIEVAL"
-        r["_missing_from_corpus"] = True
-
-    filters = r.get("filters",{})
-    is_recommendation = any(w in message.lower() for w in ["best","recommend","suggest","which policy","should i buy"])
-    if is_recommendation and not any(v for v in filters.values() if v is not None):
-        r["needs_clarification"]    = True
-        r["clarification_question"] = ("Could you share your age, approximate annual budget, "
-                                       "and any health conditions? That'll help me find the best match.")
-
-    q = r.get("specific_question","")
-    vague = ["key features","overview","tell me about","information about","details about"]
-    if any(p in q.lower() for p in vague):
-        r["specific_question"] = q + " — specifically: waiting periods, exclusions, sub-limits, room rent limit, co-payment."
-    return r
-
-def _fallback(message, error):
-    return {
-        "retrieval_decision":    "RAG",
-        "intent_description":    message,
-        "policies_mentioned":    [],
-        "not_in_corpus":         [],
-        "filters":               {},
-        "section_tags":          [],
-        "specific_question":     message,
-        "needs_clarification":   False,
-        "clarification_question": None,
-        "is_followup":           False,
-        "resolved_policy_ids":   [],
-        "_error":                str(error),
-    }
-
-def route(message, summary="", conversation_history=None):
-    eff = summary or "No prior conversation."
-    if conversation_history:
-        recent  = conversation_history[-2:]
-        eff    += "\n\nRecent:\n" + "\n".join(f"{m['role'].upper()}: {m['content'][:200]}" for m in recent)
-    inputs   = {"corpus_list":CORPUS_LIST,"summary":eff,"message":message}
-    last_err = None
-    for key, model_name in GEMINI_CANDIDATES:
-        try:
-            raw    = _make_chain(key,model_name).invoke(inputs)
-            result = _parse(raw)
-            return _validate(result, message)
-        except Exception as e:
-            last_err = e; continue
-    return _fallback(message, last_err)
+    if "
+http://googleusercontent.com/immersive_entry_chip/0
