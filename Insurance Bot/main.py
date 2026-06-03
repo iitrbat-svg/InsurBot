@@ -15,7 +15,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from router        import route, CORPUS, CORPUS_LIST
 from sql_filter    import sql_filter, get_policies
-from rag_retriever import retrieve, format_chunks, warmup
+from rag_retriever import retrieve, format_chunks
 from memory        import (load_session, save_session, add_turn, update_profile,
                            enrich_filters, resolve_followup, should_summarize, summarize)
 from pricing       import calculate_quote
@@ -27,8 +27,8 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
 GEMINI_CANDIDATES = [(k,m) for k,m in [
-    (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash"),
-    (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash-lite"),
+    (os.getenv("GEMINI_KEY"),"gemini-2.5-flash"),
+    (os.getenv("GEMINI_KEY"),"gemini-2.5-flash-lite"),
     (os.getenv("GEMINI_KEY_1"),   "gemini-2.5-flash-lite"),
     (os.getenv("GEMINI_KEY_1"),   "gemini-2.0-flash"),
     (os.getenv("GEMINI_KEY_2"),   "gemini-2.5-flash-lite"),
@@ -39,8 +39,6 @@ GEMINI_CANDIDATES = [(k,m) for k,m in [
 
 @app.on_event("startup")
 async def startup():
-    # Disabled warmup to prevent Railway Timeout/OOM during deployment
-    # await asyncio.get_event_loop().run_in_executor(None, warmup)
     print("Ready. Models will load lazily on the first request.")
 
 class ChatRequest(BaseModel):
@@ -141,7 +139,6 @@ def format_sql_context(result):
         lines.append(f"- **{p.get('insurer')} — {p.get('product_slug')}**: Max SI up to ₹{p.get('si_max_lakhs')}L, Room rent: {p.get('room_rent_limit')}, Co-pay: {p.get('copayment_percent',0)}%")
     return "\n".join(lines)
 
-# --- UPDATED SYSTEM PROMPT TO SAVE TOKENS ---
 SYSTEM_PROMPT = """You are an expert Indian health insurance advisor.
 Answer accurately based on the provided context.
 
@@ -151,8 +148,6 @@ UNIVERSAL RULES:
 3. CONCISENESS: Keep your text responses incredibly concise and easy to read.
 
 The user's intent: {intent_description}"""
-
-# ── Upgraded Pipeline Orchestration ───────────────────────────────────────────
 
 async def process_chat(req: ChatRequest):
     session = load_session(req.session_id)
@@ -191,7 +186,6 @@ async def process_chat(req: ChatRequest):
     context_blocks = []
     pricing_queue  = set(policies or router_result.get("resolved_policy_ids", []))
 
-    # Phase A: Handle Structural Filtering & Catalog Discretion
     if decision == "NO_RETRIEVAL":
         context_blocks.append(f"Available policies in database:\n{CORPUS_LIST}")
     elif decision == "SQL_ONLY" or not pricing_queue:
@@ -214,7 +208,6 @@ async def process_chat(req: ChatRequest):
         rag_text = build_rag_context(question, search_ids, section_tags or None, conditions)
         context_blocks.append(rag_text)
 
-    # Phase B: Intercept with the Premium Underwriting Engine
     if filters.get("age") and pricing_queue:
         yield f"data: {json.dumps({'type':'trace','text':f'Running dynamic calculation tables for {len(pricing_queue)} policies...'})}\n\n"
         target_si = filters.get("sum_insured_inr") or 500000
@@ -232,18 +225,13 @@ async def process_chat(req: ChatRequest):
                 
         if calculated_quotes:
             calculated_quotes.sort(key=lambda x: x["final_payable"])
-            
-            # YIELD JSON DIRECTLY TO FRONTEND TO BUILD CARDS
             yield f"data: {json.dumps({'type':'structured_quote', 'data': calculated_quotes})}\n\n"
-            
-            # TELL THE AI NOT TO WASTE TOKENS WRITING THE PRICES OUT
             llm_note = (
                 f"SYSTEM NOTE: Successfully calculated and displayed {len(calculated_quotes)} quotes in the UI cards. "
                 f"The cheapest is {calculated_quotes[0]['policy_id']}. "
                 f"DO NOT output pricing tables. The UI already shows them. Proceed to compare features directly."
             )
             context_blocks.insert(0, llm_note)
-            
         else:
             context_blocks.insert(0, (
                 "## SYSTEM PRICING ERROR\n"
@@ -251,7 +239,6 @@ async def process_chat(req: ChatRequest):
                 "Apologize to the user and state that you do not have exact premium data, but provide the feature analysis."
             ))
 
-    # Phase C: Final Synthesis Compilation
     yield f"data: {json.dumps({'type':'trace','text':'Synthesizing...'})}\n\n"
 
     system_content = SYSTEM_PROMPT.format(intent_description=intent_desc or req.message)
