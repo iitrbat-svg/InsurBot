@@ -141,15 +141,14 @@ def format_sql_context(result):
         lines.append(f"- **{p.get('insurer')} — {p.get('product_slug')}**: Max SI up to ₹{p.get('si_max_lakhs')}L, Room rent: {p.get('room_rent_limit')}, Co-pay: {p.get('copayment_percent',0)}%")
     return "\n".join(lines)
 
-SYSTEM_PROMPT = """You are an expert Indian health insurance advisor with deep knowledge of IRDAI regulations and all major Indian health insurance products.
-
-Answer the user's question accurately based on the factual calculations, policy structures, and brochure text provided in the context.
+# --- UPDATED SYSTEM PROMPT TO SAVE TOKENS ---
+SYSTEM_PROMPT = """You are an expert Indian health insurance advisor.
+Answer accurately based on the provided context.
 
 UNIVERSAL RULES:
-1. PRICING & DISCOUNTS: Always present the step-by-step pricing breakdown when quotes are available. Clearly cite the Base Premium, active deductions, and final amount including the statutory 18% GST.
-2. ADJUSTED SUM INSUREDS: If a requested cover amount was unavailable and the system quoted a nearby amount (e.g. 15L instead of 10L), you MUST explicitly tell the user about the adjustment.
-3. WAITING PERIODS: Distinguish between the 30-day initial wait, 24-month specific disease exclusions, and pre-existing disease (PED) clauses.
-4. STRUCTURED COMPARISONS: Sort cost evaluations by Rank (Cheapest first). Present tabular outputs for metrics where relevant.
+1. PRICING DELEGATION (CRITICAL): If the system successfully calculated quotes, the frontend UI will display them automatically in beautiful visual cards. DO NOT output pricing tables, step-by-step breakdowns, or lists of premiums in your text response. Instead, provide a brief, helpful summary of *why* certain options might be better based on their features (waiting periods, room rent, etc.).
+2. WAITING PERIODS: Distinguish between the 30-day initial wait, 24-month specific disease exclusions, and pre-existing disease (PED) clauses.
+3. CONCISENESS: Keep your text responses incredibly concise and easy to read.
 
 The user's intent: {intent_description}"""
 
@@ -228,39 +227,28 @@ async def process_chat(req: ChatRequest):
                 quote_res["policy_id"] = pid
                 calculated_quotes.append(quote_res)
             else:
-                # Send the exact failure reason directly to the UI trace window!
                 err_msg = quote_res.get("message", "Unknown DB Error")
                 yield f"data: {json.dumps({'type':'trace','text':f'⚠️ Pricing skipped for {pid}: {err_msg}'})}\n\n"
-                print(f"[DEBUG PRICING ENGINE] {pid} Failed: {err_msg}")
                 
         if calculated_quotes:
             calculated_quotes.sort(key=lambda x: x["final_payable"])
             
-            pricing_strings = ["## Real-Time Calculated Quotes & Underwriting Rules"]
-            for rank, q in enumerate(calculated_quotes, 1):
-                si_disclaimer = f" **[ATTENTION: {q.get('si_note')}]**" if q.get("si_note") else ""
-                zone_disclaimer = f" **[{q.get('zone_note')}]**" if q.get("zone_note") else ""
-                
-                pricing_strings.append(
-                    f"Rank {rank}: Policy ID [{q['policy_id']}]\n"
-                    f" - Input Profile: Age {filters['age']} | Cover Quoted: ₹{q.get('actual_si_used', target_si):,}{si_disclaimer}{zone_disclaimer}\n"
-                    f" - Baseline Grid Premium: ₹{q['base_premium']:,}\n"
-                    f" - Deductions Applied: {q['applied_modifiers'] or 'None'}\n"
-                    f" - Net Premium (Excl. Tax): ₹{q['net_premium_before_tax']:,}\n"
-                    f" - GST (Statutory 18%): ₹{q['gst_amount']:,}\n"
-                    f" - **Final Payable Cost (Inc. Tax): ₹{q['final_payable']:,}**\n"
-                    f" - Available Loadings Structure: {json.dumps(q.get('all_loadings', []))}\n"
-                    f" - Other Available Discount Rules: {json.dumps(q.get('all_discounts', []))}"
-                )
-            context_blocks.insert(0, "\n\n".join(pricing_strings))
+            # YIELD JSON DIRECTLY TO FRONTEND TO BUILD CARDS
+            yield f"data: {json.dumps({'type':'structured_quote', 'data': calculated_quotes})}\n\n"
+            
+            # TELL THE AI NOT TO WASTE TOKENS WRITING THE PRICES OUT
+            llm_note = (
+                f"SYSTEM NOTE: Successfully calculated and displayed {len(calculated_quotes)} quotes in the UI cards. "
+                f"The cheapest is {calculated_quotes[0]['policy_id']}. "
+                f"DO NOT output pricing tables. The UI already shows them. Proceed to compare features directly."
+            )
+            context_blocks.insert(0, llm_note)
             
         else:
             context_blocks.insert(0, (
                 "## SYSTEM PRICING ERROR\n"
-                "You tried to calculate premiums, but the database returned no matching rows "
-                f"for Age {filters['age']}. "
-                "You MUST apologize to the user and state that you do not have the exact premium "
-                "data for these policies in your database right now, but provide the feature analysis below."
+                f"No matching rows in DB for Age {filters['age']}. "
+                "Apologize to the user and state that you do not have exact premium data, but provide the feature analysis."
             ))
 
     # Phase C: Final Synthesis Compilation
