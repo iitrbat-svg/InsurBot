@@ -39,8 +39,9 @@ GEMINI_CANDIDATES = [(k,m) for k,m in [
 
 @app.on_event("startup")
 async def startup():
-    await asyncio.get_event_loop().run_in_executor(None, warmup)
-    print("Ready.")
+    # Disabled warmup to prevent Railway Timeout/OOM during deployment
+    # await asyncio.get_event_loop().run_in_executor(None, warmup)
+    print("Ready. Models will load lazily on the first request.")
 
 class ChatRequest(BaseModel):
     message:    str
