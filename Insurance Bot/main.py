@@ -1,4 +1,4 @@
-"""FastAPI Backend — Insurance Intel (with reranking, query expansion, SQL fallback)"""
+"""FastAPI Backend — Insurance Intel (with Pricing Engine, SQL fallback, and Error Trapping)"""
 import os, json, asyncio
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -10,7 +10,6 @@ load_dotenv()
 os.environ.setdefault("LANGCHAIN_TRACING_V2","true")
 os.environ.setdefault("LANGCHAIN_PROJECT","insurance-intel")
 
-import requests as _req
 from langchain_google_genai  import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -19,12 +18,15 @@ from sql_filter    import sql_filter, get_policies
 from rag_retriever import retrieve, format_chunks, warmup
 from memory        import (load_session, save_session, add_turn, update_profile,
                            enrich_filters, resolve_followup, should_summarize, summarize)
+from pricing       import calculate_quote
 
 app = FastAPI(title="Insurance Intel API")
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["*"],allow_headers=["*"])
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+
+# Key Rotation Pool
 GEMINI_CANDIDATES = [(k,m) for k,m in [
     (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash"),
     (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash-lite"),
@@ -45,24 +47,11 @@ class ChatRequest(BaseModel):
     message:    str
     session_id: str = "default"
 
-def _sbh(): return {"apikey":SUPABASE_KEY,"Authorization":f"Bearer {SUPABASE_KEY}"}
-
-# ── Query expansion ────────────────────────────────────────────────────────────
-# Expands query with synonyms before embedding — improves RAG recall.
-# Uses cheapest model. Falls back to original query on failure.
-
 def expand_query(question: str, conditions: list) -> str:
-    """
-    Add insurance-specific synonyms and alternate phrasings to the query.
-    E.g. "jaundice" → also includes "liver disease, hepatitis, acute illness hospitalization"
-    This improves vector search recall without changing the meaning.
-    """
-    if not conditions:
-        return question
-    key, model = GEMINI_CANDIDATES[-1]   # cheapest/fastest model
+    if not conditions: return question
+    key, model = GEMINI_CANDIDATES[-1]
     try:
-        llm  = ChatGoogleGenerativeAI(model=model, google_api_key=key,
-                                      temperature=0, max_output_tokens=150)
+        llm  = ChatGoogleGenerativeAI(model=model, google_api_key=key, temperature=0, max_output_tokens=150)
         resp = llm.invoke([HumanMessage(content=
             f"""For this Indian health insurance query, add 3-5 relevant medical/insurance synonyms
 and alternate terms that would appear in policy documents. Keep it concise.
@@ -71,55 +60,27 @@ Output ONLY the expanded query, no explanation.
 Original: {question}
 Conditions mentioned: {', '.join(conditions)}
 
-Example: "jaundice hospitalization" → "jaundice hepatitis liver disease acute illness 
-hospitalization general inpatient coverage 30 day waiting period"
-
 Expanded query:""")])
         expanded = resp.content.strip()
         return expanded if expanded else question
     except Exception:
-        return question   # silent fallback
-
-# ── Reranking ─────────────────────────────────────────────────────────────────
-# After RAG retrieval, score chunks for relevance to the specific question.
-# Drops weak chunks — stops irrelevant text confusing the synthesizer.
-
-RERANK_THRESHOLD = 0.42
+        return question
 
 def rerank_chunks(chunks: list, question: str) -> list:
-    """
-    Filter chunks by similarity threshold.
-    If too few remain above threshold, keep top-3 minimum.
-    Also deduplicate near-identical chunks (same policy, similarity diff < 0.02).
-    """
-    if not chunks:
-        return chunks
-
-    # Apply threshold
-    filtered = [c for c in chunks if c.get("similarity",0) >= RERANK_THRESHOLD]
-
-    # Keep at least 3
+    if not chunks: return chunks
+    filtered = [c for c in chunks if c.get("similarity",0) >= 0.42]
     if len(filtered) < 3:
         filtered = sorted(chunks, key=lambda c: c.get("similarity",0), reverse=True)[:3]
-
-    # Deduplicate: remove chunks from same policy+section that are near-duplicates
-    seen     = {}
-    deduped  = []
+    seen, deduped = {}, []
     for c in filtered:
         key = f"{c.get('policy_id')}_{c.get('section_tag')}"
         prev_sim = seen.get(key)
         if prev_sim is None or abs(c.get("similarity",0) - prev_sim) > 0.05:
             deduped.append(c)
             seen[key] = c.get("similarity",0)
-
     return deduped
 
-# ── SQL context fallback ───────────────────────────────────────────────────────
-# If RAG returns weak results, fall back to structured policy data.
-# Always gives correct metadata even when clause text isn't found.
-
 def sql_context_for_candidates(candidate_ids: list) -> str:
-    """Format structured policy data as readable context."""
     if not candidate_ids: return ""
     policies = get_policies(candidate_ids[:8])
     if not policies: return ""
@@ -135,41 +96,22 @@ def sql_context_for_candidates(candidate_ids: list) -> str:
             ("Co-payment",              f"{p.get('copayment_percent',0)}%"),
             ("Maternity",               "Covered" if p.get("maternity_covered") else "Not covered"),
             ("Restore",                 p.get("restore_type") or ("Yes" if p.get("restore_benefit") else "No")),
-            ("NCB",                     f"{p.get('no_claim_bonus_percent')}%/yr" if p.get("no_claim_bonus_percent") else None),
-            ("Network Hospitals",       f"{p.get('network_hospitals'):,}" if p.get("network_hospitals") else None),
-            ("Claim Settlement Ratio",  f"{p.get('claim_settlement_ratio')}%" if p.get("claim_settlement_ratio") else None),
-            ("Diabetes",                p.get("diabetes_notes") or ("Covered" if p.get("diabetes_covered") else None)),
-            ("Cardiac",                 p.get("cardiac_notes") or ("Covered" if p.get("cardiac_covered") else None)),
         ]:
-            if val and "None" not in str(val):
-                lines.append(f"- **{label}**: {val}")
+            if val and "None" not in str(val): lines.append(f"- **{label}**: {val}")
         lines.append("")
     return "\n".join(lines)
 
 def rag_quality_ok(chunks: list) -> bool:
-    """True if at least 2 chunks have similarity >= 0.5."""
     return sum(1 for c in chunks if c.get("similarity",0) >= 0.5) >= 2
 
-# ── Context builders ───────────────────────────────────────────────────────────
-
 def build_rag_context(question, policy_ids, section_tags, conditions=None):
-    # Expand query with synonyms
     expanded = expand_query(question, conditions or [])
-
-    # Retrieve
-    result = retrieve(expanded, policy_ids=policy_ids,
-                      section_tags=section_tags, top_k=10)
-    chunks = result.get("chunks",[])
-
-    # Rerank
-    chunks = rerank_chunks(chunks, question)
-
-    # Check quality — fallback to SQL context if RAG is weak
+    result = retrieve(expanded, policy_ids=policy_ids, section_tags=section_tags, top_k=10)
+    chunks = rerank_chunks(result.get("chunks",[]), question)
     rag_text = format_chunks({"chunks":chunks}, max_chunks=6)
     if not rag_quality_ok(chunks) and policy_ids:
         sql_text = sql_context_for_candidates(policy_ids)
-        if sql_text:
-            return sql_text + "\n\n## Additional Clause Details\n" + rag_text
+        if sql_text: return sql_text + "\n\n## Additional Clause Details\n" + rag_text
     return rag_text
 
 def build_fc_context(policy_ids, question, conditions=None):
@@ -185,11 +127,6 @@ def build_fc_context(policy_ids, question, conditions=None):
             ("PED Waiting",             f"{p.get('ped_waiting_months')}m" if p.get('ped_waiting_months') else None),
             ("Specific Illness Waiting",f"{p.get('specific_illness_waiting')}m" if p.get('specific_illness_waiting') else None),
             ("Co-payment",              f"{p.get('copayment_percent',0)}%"),
-            ("Maternity",               "Yes" if p.get("maternity_covered") else "No"),
-            ("Restore",                 p.get("restore_type") or ("Yes" if p.get("restore_benefit") else "No")),
-            ("NCB",                     f"{p.get('no_claim_bonus_percent')}%/yr" if p.get("no_claim_bonus_percent") else None),
-            ("Network Hospitals",       p.get("network_hospitals")),
-            ("CSR",                     f"{p.get('claim_settlement_ratio')}%" if p.get("claim_settlement_ratio") else None),
         ]:
             if val and "None" not in str(val): lines.append(f"- **{label}**: {val}")
         lines.append("")
@@ -201,81 +138,26 @@ def format_sql_context(result):
     if not candidates: return "No matching policies found for the given criteria."
     lines = [f"Found {len(candidates)} matching policies:\n"]
     for p in candidates:
-        lines.append(
-            f"- **{p.get('insurer')} — {p.get('product_slug')}**: "
-            f"SI up to ₹{p.get('si_max_lakhs')}L, "
-            f"Initial wait 30 days, "
-            f"PED wait {p.get('ped_waiting_months')}m, "
-            f"Specific illness wait {p.get('specific_illness_waiting') or 'N/A'}m, "
-            f"Room rent: {p.get('room_rent_limit')}, "
-            f"Co-pay: {p.get('copayment_percent',0)}%, "
-            f"CSR: {p.get('claim_settlement_ratio')}%"
-        )
+        lines.append(f"- **{p.get('insurer')} — {p.get('product_slug')}**: Max SI up to ₹{p.get('si_max_lakhs')}L, Room rent: {p.get('room_rent_limit')}, Co-pay: {p.get('copayment_percent',0)}%")
     return "\n".join(lines)
-
-# ── Synthesizer prompt ─────────────────────────────────────────────────────────
-# One universal prompt instead of 10 rigid ones.
-# The LLM uses judgment based on the intent_description.
 
 SYSTEM_PROMPT = """You are an expert Indian health insurance advisor with deep knowledge of IRDAI regulations and all major Indian health insurance products.
 
-Answer the user's question based on the policy information provided in the context.
-Apply sound judgment — you know Indian health insurance well.
+Answer the user's question accurately based on the factual calculations, policy structures, and brochure text provided in the context.
 
-UNIVERSAL RULES — apply to every response:
-
-1. WAITING PERIODS — always distinguish clearly:
-   - Initial waiting period: 30 days, applies to ALL policies, ALL conditions (except accidents)
-   - Specified disease waiting period: typically 24 months, applies ONLY to listed conditions
-     (gall bladder/bile duct stones, hernia, cataract, knee/joint replacement, tonsils,
-     hysterectomy, benign tumors, varicose veins, piles/fissures, hydrocele, sinusitis,
-     spinal disc disorders, ENT procedures, osteoarthritis)
-   - PED waiting period: 24-48 months, for declared pre-existing conditions (diabetes, BP, cardiac)
-   
-   ACUTE ILLNESSES (jaundice, dengue, typhoid, malaria, fever, appendicitis, fracture,
-   pneumonia, food poisoning, infections, stroke, emergency) have NO specified disease wait.
-   They are covered after the standard 30-day initial waiting period under ALL policies.
-   State this clearly and confidently — do not say "not found in retrieved data" for acute illnesses.
-
-2. MISSING DATA — if a specific value isn't in the context:
-   - For acute illnesses: confidently state "covered after 30-day initial wait"
-   - For structured fields (premiums, network size): use the structured data provided
-   - Only say "not found in retrieved policy data" for truly obscure clause details
-   - Never repeat "not found" more than once in a response
-
-3. RECOMMENDATIONS — always rank by fit. State the decisive factor clearly.
-   Structure: top pick first, then alternatives, then what to watch out for.
-
-4. COMPARISONS — use structured format. One section per parameter. End with a verdict table.
-
-5. GENERAL QUESTIONS (what is NCB, how does waiting period work, what is TPA) —
-   answer from your knowledge directly. No retrieval context needed.
-
-6. CORPUS OVERVIEW — if asked about available policies, list from the provided corpus.
-   Group by insurer. Don't attempt clause-level analysis.
-
-7. ALWAYS cite specific numbers: months, ₹ amounts, percentages.
-   Bold the key numbers. Use bullet points for lists.
-
-8. HONESTY — if you genuinely don't know something, say so once and move on.
-   Never pad with filler. Be direct and useful.
+UNIVERSAL RULES:
+1. PRICING & DISCOUNTS: Always present the step-by-step pricing breakdown when quotes are available. Clearly cite the Base Premium, active deductions, and final amount including the statutory 18% GST.
+2. WAITING PERIODS: Distinguish between the 30-day initial wait, 24-month specific disease exclusions, and pre-existing disease (PED) clauses. Acute illnesses are covered after 30 days.
+3. STRUCTURED COMPARISONS: Sort cost evaluations by Rank (Cheapest first). Present tabular outputs for metrics where relevant.
 
 The user's intent: {intent_description}"""
 
-# ── Pipeline ───────────────────────────────────────────────────────────────────
+# ── Upgraded Pipeline Orchestration ───────────────────────────────────────────
 
 async def process_chat(req: ChatRequest):
-    # Load session memory
     session = load_session(req.session_id)
 
-    # Route
-    router_result = route(
-        req.message,
-        summary=session["summary"],
-        conversation_history=session["recent_messages"],
-    )
-
-    # Apply memory
+    router_result = route(req.message, summary=session["summary"], conversation_history=session["recent_messages"])
     router_result            = resolve_followup(router_result, session)
     router_result["filters"] = enrich_filters(router_result.get("filters",{}), session)
     session                  = update_profile(session, router_result.get("filters",{}))
@@ -290,7 +172,6 @@ async def process_chat(req: ChatRequest):
 
     yield f"data: {json.dumps({'type':'route','decision':decision,'policies':policies,'intent':intent_desc[:80]})}\n\n"
 
-    # Clarification
     if router_result.get("needs_clarification"):
         q = router_result.get("clarification_question","Could you provide more details?")
         session = add_turn(session, req.message, q)
@@ -299,65 +180,104 @@ async def process_chat(req: ChatRequest):
         yield f"data: {json.dumps({'type':'answer','text':q})}\n\n"
         yield "data: [DONE]\n\n"; return
 
-    # Missing from corpus
     if router_result.get("_missing_from_corpus"):
         names = router_result.get("not_in_corpus",[])
-        msg   = (f"I don't have {', '.join(names)} in my database. "
-                 f"You can upload its policy document and I'll analyse it. "
-                 f"Currently I cover: {', '.join(set(p['insurer'] for p in CORPUS))}.")
+        msg   = f"I don't have {', '.join(names)} in my database. Currently I cover: {', '.join(set(p['insurer'] for p in CORPUS))}."
         session = add_turn(session, req.message, msg)
         save_session(req.session_id, session)
         yield f"data: {json.dumps({'type':'answer','text':msg})}\n\n"
         yield "data: [DONE]\n\n"; return
 
-    # Build context based on retrieval decision
-    context = ""
+    # Stitched Processing Context Arrays
+    context_blocks = []
+    pricing_queue  = set(policies or router_result.get("resolved_policy_ids", []))
 
+    # Phase A: Handle Structural Filtering & Catalog Discretion
     if decision == "NO_RETRIEVAL":
-        # Give corpus list so LLM can answer "what policies do you have" questions
-        context = f"Available policies in database:\n{CORPUS_LIST}"
-
-    elif decision == "SQL_ONLY":
-        sql_res = sql_filter(filters, "sql", limit=10)
-        context = format_sql_context(sql_res)
+        context_blocks.append(f"Available policies in database:\n{CORPUS_LIST}")
+    elif decision == "SQL_ONLY" or not pricing_queue:
+        sql_res = sql_filter(filters, "sql", limit=5)
+        context_blocks.append(format_sql_context(sql_res))
+        for cand in sql_res.get("candidates", []):
+            pricing_queue.add(cand["id"])
         session["last_candidate_ids"] = [c["id"] for c in sql_res.get("candidates",[])]
-
     elif decision == "FC":
-        context = build_fc_context(policies, question, conditions)
+        context_blocks.append(build_fc_context(list(pricing_queue), question, conditions))
+    else:
+        # Standard RAG Flow
+        has_filters = any(v for k, v in filters.items() if v is not None and k not in ["age", "sum_insured_inr", "zone"])
+        search_ids = list(pricing_queue)
+        if has_filters and not search_ids:
+            sql_res = sql_filter(filters, "rag", limit=5)
+            search_ids = [c["id"] for c in sql_res.get("candidates",[])]
+            session["last_candidate_ids"] = search_ids
+            for sid in search_ids: pricing_queue.add(sid)
+        
+        rag_text = build_rag_context(question, search_ids, section_tags or None, conditions)
+        context_blocks.append(rag_text)
 
-    else:  # RAG
-        # SQL filter first if we have meaningful filters
-        candidate_ids = None
-        has_filters   = any(v for v in filters.values() if v is not None)
+    # Phase B: Intercept with the Premium Underwriting Engine
+    if filters.get("age") and pricing_queue:
+        yield f"data: {json.dumps({'type':'trace','text':'Running dynamic calculation tables...'})}\n\n"
+        target_si = filters.get("sum_insured_inr") or 500000
+        target_zone = filters.get("zone") or "All"
+        
+        calculated_quotes = []
+        for pid in list(pricing_queue)[:6]:
+            quote_res = calculate_quote(pid, int(filters["age"]), sum_insured=target_si, zone=target_zone)
+            if quote_res["status"] == "success":
+                quote_res["policy_id"] = pid
+                calculated_quotes.append(quote_res)
+                
+        if calculated_quotes:
+            # Enforce ascending cost ordering across extracted profiles
+            calculated_quotes.sort(key=lambda x: x["final_payable"])
+            
+            pricing_strings = ["## Real-Time Calculated Quotes & Underwriting Rules"]
+            for rank, q in enumerate(calculated_quotes, 1):
+                pricing_strings.append(
+                    f"Rank {rank}: Policy ID [{q['policy_id']}]\n"
+                    f" - Input Profile: Age {filters['age']} | Coverage Level: ₹{target_si:,}\n"
+                    f" - Baseline Grid Premium: ₹{q['base_premium']:,}\n"
+                    f" - Deductions Applied: {q['applied_modifiers'] or 'None'}\n"
+                    f" - Net Premium (Excl. Tax): ₹{q['net_premium_before_tax']:,}\n"
+                    f" - GST (Statutory 18%): ₹{q['gst_amount']:,}\n"
+                    f" - **Final Payable Cost (Inc. Tax): ₹{q['final_payable']:,}**\n"
+                    f" - Available Loadings Structure: {json.dumps(q['all_loadings'])}\n"
+                    f" - Other Available Discount Rules: {json.dumps(q['all_discounts'])}"
+                )
+            context_blocks.insert(0, "\n\n".join(pricing_strings))
+            
+        else:
+            # --- THE "NO SILENT FAILURES" TRAP ---
+            # If quotes failed, we inject this warning so the AI can explain the missing data.
+            context_blocks.insert(0, (
+                "## SYSTEM PRICING ERROR\n"
+                "You tried to calculate premiums, but the database returned no matching rows "
+                f"for Age {filters['age']} and SI {target_si}. "
+                "You MUST apologize to the user and state that you do not have the exact premium "
+                "data for these policies in your database right now, but provide the feature analysis below."
+            ))
 
-        if has_filters and not policies:
-            sql_res       = sql_filter(filters, "rag", limit=12)
-            candidate_ids = [c["id"] for c in sql_res.get("candidates",[])]
-            session["last_candidate_ids"] = candidate_ids
-            yield f"data: {json.dumps({'type':'trace','text':f'Filtered to {len(candidate_ids)} candidates'})}\n\n"
-
-        search_ids = policies if policies else candidate_ids
-        context    = build_rag_context(question, search_ids, section_tags or None, conditions)
-
+    # Phase C: Final Synthesis Compilation
     yield f"data: {json.dumps({'type':'trace','text':'Synthesizing...'})}\n\n"
 
-    # Build messages
     system_content = SYSTEM_PROMPT.format(intent_description=intent_desc or req.message)
     user_content   = f"Question: {req.message}\n"
     profile        = {k:v for k,v in filters.items() if v is not None}
-    if profile:                    user_content += f"User profile: {json.dumps(profile)}\n"
-    if session.get("summary"):     user_content += f"Conversation so far: {session['summary']}\n"
-    if context:                    user_content += f"\nPolicy Information:\n{context}"
+    if profile:                user_content += f"User profile matrix: {json.dumps(profile)}\n"
+    if session.get("summary"):     user_content += f"Conversation historical state: {session['summary']}\n"
+    
+    final_context = "\n\n".join(context_blocks)
+    if final_context:          user_content += f"\nAssembled Context Layer:\n{final_context}"
 
     messages = [SystemMessage(content=system_content), HumanMessage(content=user_content)]
 
-    # Stream with key rotation
     full_answer = ""
     last_err    = None
     for key, model_name in GEMINI_CANDIDATES:
         try:
-            llm = ChatGoogleGenerativeAI(model=model_name, google_api_key=key,
-                                          temperature=0.3, streaming=True)
+            llm = ChatGoogleGenerativeAI(model=model_name, google_api_key=key, temperature=0.2, streaming=True)
             async for chunk in llm.astream(messages):
                 if chunk.content:
                     full_answer += chunk.content
@@ -371,7 +291,6 @@ async def process_chat(req: ChatRequest):
     if not full_answer and last_err:
         yield f"data: {json.dumps({'type':'error','text':f'All models failed: {last_err}'})}\n\n"
 
-    # Save memory
     session = add_turn(session, req.message, full_answer)
     if should_summarize(session):
         yield f"data: {json.dumps({'type':'trace','text':'Updating memory...'})}\n\n"
@@ -379,8 +298,6 @@ async def process_chat(req: ChatRequest):
     save_session(req.session_id, session)
 
     yield "data: [DONE]\n\n"
-
-# ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.post("/chat")
 async def chat(req: ChatRequest):

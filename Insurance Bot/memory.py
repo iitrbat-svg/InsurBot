@@ -109,7 +109,7 @@ def update_profile(session: dict, filters: dict) -> dict:
     both are available in turn 4.
     """
     profile = session.get("user_profile", {})
-    for key in ["age","budget_yearly_inr","budget_monthly_inr","city_tier"]:
+    for key in ["age", "budget_yearly_inr", "city_tier", "sum_insured_inr", "zone"]:
         if filters.get(key) is not None:
             profile[key] = filters[key]
     # Merge conditions (deduplicate)
