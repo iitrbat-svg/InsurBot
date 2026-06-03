@@ -1,5 +1,5 @@
 """
-Pricing Calculation Module with Fuzzy Age Matching and Closest SI Fallback.
+Pricing Calculation Module with Fuzzy Age Matching and Closest SI & Zone Fallbacks.
 """
 import os
 import requests
@@ -20,13 +20,10 @@ def _h():
 def matches_age(band_str, age):
     """
     Intelligently parses messy age band strings.
-    E.g., "36 - 45 Years" -> matches if age is between 36 and 45.
-    E.g., "Upto 25" -> matches if age <= 25.
     """
     if not band_str: return False
     text = str(band_str).lower().strip()
     
-    # Extract all numbers from the string
     nums = [int(n) for n in re.findall(r'\d+', text)]
     
     if len(nums) >= 2:
@@ -36,19 +33,16 @@ def matches_age(band_str, age):
             return age <= nums[0]
         if '>' in text or 'above' in text or '+' in text:
             return age >= nums[0]
-        # If it's just a single number, assume it's an exact age
         return age == nums[0]
     return False
 
 def calculate_quote(policy_id: str, age: int, requested_si: int, zone: str = "All") -> dict:
-    """Fetches premiums and automatically resolves mismatched Age Bands and Sum Insureds."""
-    
     # 1. Fetch a broad block of premiums for this policy to search in-memory
     url = f"{SUPABASE_URL}/rest/v1/policy_premiums?policy_id=eq.{policy_id}&limit=3000"
     all_premiums = requests.get(url, headers=_h()).json()
     
     if not all_premiums:
-        return {"status": "error", "message": f"No premium data found in DB for {policy_id}."}
+        return {"status": "error", "message": f"No premium rows found in DB for ID '{policy_id}'."}
 
     # 2. Find the correct Age Band dynamically
     matched_band = None
@@ -63,13 +57,24 @@ def calculate_quote(policy_id: str, age: int, requested_si: int, zone: str = "Al
     # 3. Filter premiums by this age band and zone
     age_filtered = [p for p in all_premiums if p['age_band'] == matched_band]
     
-    # Try exact zone match first, fallback to 'All' or empty
+    # Try exact zone match first
     zone_filtered = [p for p in age_filtered if str(p.get('zone', '')).lower() == zone.lower()]
+    
+    # Fallback 1: Try 'All', '', or 'None'
     if not zone_filtered:
         zone_filtered = [p for p in age_filtered if str(p.get('zone', '')).lower() in ["all", "", "none"]]
         
+    # Fallback 2: The Zone Trap! Grab whatever zone is available if 'All' isn't explicitly there
+    zone_note = None
+    if not zone_filtered and age_filtered:
+        available_zones = sorted(list(set([str(p.get('zone', '')) for p in age_filtered])))
+        if available_zones:
+            fallback_zone = available_zones[0]
+            zone_filtered = [p for p in age_filtered if str(p.get('zone', '')) == fallback_zone]
+            zone_note = f"Zone adjusted to {fallback_zone}"
+
     if not zone_filtered:
-        return {"status": "error", "message": f"No zone data found."}
+        return {"status": "error", "message": f"No zone data found for age {age}."}
 
     # 4. Smart Sum Insured Matching (Find closest available)
     available_sis = sorted(list(set([p['sum_insured'] for p in zone_filtered])))
@@ -80,10 +85,9 @@ def calculate_quote(policy_id: str, age: int, requested_si: int, zone: str = "Al
     si_note = None
     
     if requested_si not in available_sis:
-        # Math magic: Find the SI with the smallest absolute difference to what the user asked for
         closest_si = min(available_sis, key=lambda x: abs(x - requested_si))
         target_si = closest_si
-        si_note = f"Requested ₹{requested_si/100000:g}L was unavailable. System quoted the closest available option: ₹{target_si/100000:g}L."
+        si_note = f"Requested ₹{requested_si/100000:g}L unavailable. Quoted closest match: ₹{target_si/100000:g}L"
 
     # Retrieve the exact base premium for our finalized SI
     base_premium = next((p['base_premium'] for p in zone_filtered if p['sum_insured'] == target_si), 0)
@@ -119,6 +123,7 @@ def calculate_quote(policy_id: str, age: int, requested_si: int, zone: str = "Al
         "final_payable": int(final_premium),
         "actual_si_used": target_si,
         "si_note": si_note,
+        "zone_note": zone_note,
         "all_discounts": discounts,
         "all_loadings": loadings
     }
