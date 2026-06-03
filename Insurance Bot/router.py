@@ -15,8 +15,8 @@ os.environ.setdefault("LANGCHAIN_TRACING_V2","true")
 os.environ.setdefault("LANGCHAIN_PROJECT","insurance-intel")
 
 GEMINI_CANDIDATES = [(k,m) for k,m in [
-    (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash"),
-    (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash-lite"),
+    
+    
     (os.getenv("GEMINI_KEY_1"),   "gemini-2.5-flash-lite"),
     (os.getenv("GEMINI_KEY_1"),   "gemini-2.0-flash"),
     (os.getenv("GEMINI_KEY_2"),   "gemini-2.5-flash-lite"),
