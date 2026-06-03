@@ -15,6 +15,8 @@ os.environ.setdefault("LANGCHAIN_TRACING_V2","true")
 os.environ.setdefault("LANGCHAIN_PROJECT","insurance-intel")
 
 GEMINI_CANDIDATES = [(k,m) for k,m in [
+    (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash"),
+    (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash-lite"),
     (os.getenv("GEMINI_KEY_1"),   "gemini-2.5-flash-lite"),
     (os.getenv("GEMINI_KEY_1"),   "gemini-2.0-flash"),
     (os.getenv("GEMINI_KEY_2"),   "gemini-2.5-flash-lite"),
@@ -105,7 +107,24 @@ def _make_chain(key, model):
 
 def _parse(raw):
     raw = raw.strip()
-    if "
-http://googleusercontent.com/immersive_entry_chip/0
+    # Fixed string matching so chat UI doesn't break the copy-paste
+    bt = "`" * 3
+    if bt in raw: 
+        raw = re.sub(bt + r"(?:json)?", "", raw).strip().rstrip("`").strip()
+    s,e = raw.find("{"), raw.rfind("}")
+    if s==-1 or e==-1: raise ValueError(f"No JSON: {raw[:100]}")
+    return json.loads(raw[s:e+1])
 
-Overwrite your local files with these completely fixed scripts, push them to Github, let Railway deploy, and the app's UI/backend will perfectly process and render your 10 Lakhs request!
+def _validate(r, message):
+    if r.get("retrieval_decision") not in VALID_DECISIONS:
+        r["retrieval_decision"] = "RAG"
+    r.setdefault("policies_mentioned",[])
+    r.setdefault("not_in_corpus",[])
+    r.setdefault("section_tags",[])
+    r.setdefault("resolved_policy_ids",[])
+    r.setdefault("filters",{})
+    r.setdefault("needs_clarification",False)
+    r.setdefault("clarification_question",None)
+    r.setdefault("is_followup",False)
+    r.setdefault("insurer_mentioned",None)
+    r.setdefault("intent_description","
