@@ -163,8 +163,6 @@ UNIVERSAL RULES (CRITICAL):
 **💡 Final Verdict**
 [A quick closing thought on how the user should decide based on their budget vs. features.]"""
 
-The user's intent: {intent_description}"""
-
 # ── Upgraded Pipeline Orchestration ───────────────────────────────────────────
 
 async def process_chat(req: ChatRequest):
