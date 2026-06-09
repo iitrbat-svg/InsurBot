@@ -16,7 +16,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from router        import route, CORPUS, CORPUS_LIST
 from sql_filter    import sql_filter, get_policies
-from rag_retriever import retrieve, format_chunks, warmup
+from rag_retriever import retrieve, format_chunks
 from memory        import (load_session, save_session, add_turn, update_profile,
                            enrich_filters, resolve_followup, should_summarize, summarize)
 from pricing       import calculate_quote
@@ -132,22 +132,19 @@ def build_fc_context(policy_ids, question, conditions=None):
     lines += ["\n## Relevant Policy Clauses\n", rag_text]
     return "\n".join(lines)
 
+# --- REWRITTEN TO AVOID SPAMMING THE LLM WITH 30 INCOMPLETE POLICIES ---
 def format_sql_context(result):
     candidates = result.get("candidates",[])
     if not candidates: return "No matching policies found for the given criteria."
-    lines = [f"Found {len(candidates)} matching policies:\n"]
-    for p in candidates:
-        lines.append(f"- **{p.get('insurer')} — {p.get('product_slug')}**: Max SI up to ₹{p.get('si_max_lakhs')}L, Room rent: {p.get('room_rent_limit')}, Co-pay: {p.get('copayment_percent',0)}%")
-    return "\n".join(lines)
+    return f"System found {len(candidates)} matching policies in the catalog. Passing to the pricing engine."
 
-# --- REWRITTEN SYSTEM PROMPT TO FORCE EXPLICIT PRICING OUTPUT ---
 SYSTEM_PROMPT = """You are an expert Indian health insurance advisor with deep knowledge of IRDAI regulations and all major Indian health insurance products.
 
 Answer the user's question accurately based on the factual calculations, policy structures, and brochure text provided in the context.
 
 UNIVERSAL RULES:
 1. EXPLICIT PRICING REQUIRED (CRITICAL): If the system provides calculated quotes in the context below, you MUST explicitly name ALL the top policies provided and their EXACT premium amounts in your text response. The user relies on your text to compare the exact costs.
-2. COMPARISON: Group the policies by price and briefly summarize why they are good options based on their features (waiting periods, room rent, etc.).
+2. COMPARISON: Group the policies by price and write a highly detailed summary comparing them based on ALL available benchmarks (PED waiting periods, specific illness wait times, restore limits, room rent, maternity, etc.).
 3. ADJUSTED SUM INSUREDS: If a requested cover amount was unavailable and the system quoted a nearby amount (e.g. 15L instead of 10L), explicitly tell the user about the adjustment.
 
 The user's intent: {intent_description}"""
@@ -249,14 +246,19 @@ async def process_chat(req: ChatRequest):
             # YIELD TO THE FRONTEND TO BUILD THE CARDS!
             yield f"data: {json.dumps({'type':'structured_quote', 'data': top_quotes})}\n\n"
             
-            # --- THE FIX: DYNAMICALLY INJECT ALL PRICES AND POLICIES INTO THE AI'S BRAIN ---
+            # --- NEW SMART FETCH: GET RICH BENCHMARKS ONLY FOR THE 5 WINNERS ---
+            top_ids = [q["policy_id"] for q in top_quotes]
+            rich_benchmarks = sql_context_for_candidates(top_ids)
+            
             quote_text = "\n".join([f"- **{q['policy_id'].replace('_', ' ')}**: ₹{q['final_payable']:,.0f}/year" for q in top_quotes])
             
             llm_note = (
-                f"## CALCULATED QUOTES (Top {len(top_quotes)} Cheapest)\n"
+                f"## FINAL CALCULATED QUOTES (Top {len(top_quotes)} Cheapest)\n"
                 f"{quote_text}\n\n"
-                "SYSTEM NOTE: You MUST list these exact policies and their premium amounts in your text response. "
-                "Compare their key features (room rent, co-pay, waiting periods) to help the user choose."
+                f"## DETAILED POLICY BENCHMARKS\n"
+                f"{rich_benchmarks}\n\n"
+                "SYSTEM NOTE: You MUST list the top policies and their premium amounts in your text response. "
+                "Use the 'Detailed Policy Benchmarks' above to compare their waiting periods (PED, Specific Illness), Restore benefits, and Room Rent limits. Do not just rely on room rent!"
             )
             context_blocks.insert(0, llm_note)
             
