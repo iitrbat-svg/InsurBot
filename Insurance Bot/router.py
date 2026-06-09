@@ -15,8 +15,8 @@ os.environ.setdefault("LANGCHAIN_TRACING_V2","true")
 os.environ.setdefault("LANGCHAIN_PROJECT","insurance-intel")
 
 GEMINI_CANDIDATES = [(k,m) for k,m in [
-    
-    
+    (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash"),
+    (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash-lite"),
     (os.getenv("GEMINI_KEY_1"),   "gemini-2.5-flash-lite"),
     (os.getenv("GEMINI_KEY_1"),   "gemini-2.0-flash"),
     (os.getenv("GEMINI_KEY_2"),   "gemini-2.5-flash-lite"),
@@ -82,7 +82,10 @@ Return ONLY valid JSON. No markdown, no explanation.
 }}
 
 CRITICAL PRICING & COMPARISON RULES:
-1. If the user asks "Which is cheapest?", "Compare prices", "How much does it cost?", or explicitly requests numerical quotes, you MUST capture their `age` and `sum_insured_inr` inside the `filters` block if identifiable.
+1. If the user asks "Which is cheapest?", "Compare prices", "How much does it cost?", "What is the best policy?", "Which policies are cheapest?", or explicitly requests numerical quotes/comparisons, you MUST:
+   - Capture their `age` inside the filters block.
+   - Capture the cover amount in `sum_insured_inr` (e.g., 10 lakhs = 1000000, 5L = 500000).
+   - Set `retrieval_decision` to "SQL_ONLY".
 2. If they ask to compare specific policies, ensure ALL mentioned policies match target items and are loaded into `policies_mentioned` or `resolved_policy_ids`.
 3. If they seek the "cheapest option" across the entire catalog without specifying a policy, set `retrieval_decision` to "SQL_ONLY" to fetch top catalog matches, which the engine will then score and run pricing calculations on.
 
@@ -107,7 +110,6 @@ def _make_chain(key, model):
 
 def _parse(raw):
     raw = raw.strip()
-    # Fixed string matching so chat UI doesn't break the copy-paste
     bt = "`" * 3
     if bt in raw: 
         raw = re.sub(bt + r"(?:json)?", "", raw).strip().rstrip("`").strip()
