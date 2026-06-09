@@ -16,7 +16,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from router        import route, CORPUS, CORPUS_LIST
 from sql_filter    import sql_filter, get_policies
-from rag_retriever import retrieve, format_chunks
+from rag_retriever import retrieve, format_chunks, warmup
 from memory        import (load_session, save_session, add_turn, update_profile,
                            enrich_filters, resolve_followup, should_summarize, summarize)
 from pricing       import calculate_quote
@@ -140,15 +140,19 @@ def format_sql_context(result):
         lines.append(f"- **{p.get('insurer')} — {p.get('product_slug')}**: Max SI up to ₹{p.get('si_max_lakhs')}L, Room rent: {p.get('room_rent_limit')}, Co-pay: {p.get('copayment_percent',0)}%")
     return "\n".join(lines)
 
-SYSTEM_PROMPT = """You are an expert Indian health insurance advisor.
-Answer accurately based on the provided context.
+# --- REWRITTEN SYSTEM PROMPT TO FORCE EXPLICIT PRICING OUTPUT ---
+SYSTEM_PROMPT = """You are an expert Indian health insurance advisor with deep knowledge of IRDAI regulations and all major Indian health insurance products.
+
+Answer the user's question accurately based on the factual calculations, policy structures, and brochure text provided in the context.
 
 UNIVERSAL RULES:
-1. PRICING DELEGATION (CRITICAL): If the system successfully calculated quotes, the frontend UI will display them automatically in beautiful visual cards. DO NOT output pricing tables, step-by-step breakdowns, or lists of premiums in your text response. Instead, provide a brief, helpful summary of *why* certain options might be better based on their features (waiting periods, room rent, etc.).
-2. WAITING PERIODS: Distinguish between the 30-day initial wait, 24-month specific disease exclusions, and pre-existing disease (PED) clauses.
-3. CONCISENESS: Keep your text responses incredibly concise and easy to read.
+1. EXPLICIT PRICING REQUIRED (CRITICAL): If the system provides calculated quotes in the context below, you MUST explicitly name ALL the top policies provided and their EXACT premium amounts in your text response. The user relies on your text to compare the exact costs.
+2. COMPARISON: Group the policies by price and briefly summarize why they are good options based on their features (waiting periods, room rent, etc.).
+3. ADJUSTED SUM INSUREDS: If a requested cover amount was unavailable and the system quoted a nearby amount (e.g. 15L instead of 10L), explicitly tell the user about the adjustment.
 
 The user's intent: {intent_description}"""
+
+# ── Upgraded Pipeline Orchestration ───────────────────────────────────────────
 
 async def process_chat(req: ChatRequest):
     session = load_session(req.session_id)
@@ -191,8 +195,7 @@ async def process_chat(req: ChatRequest):
     if decision == "NO_RETRIEVAL":
         context_blocks.append(f"Available policies in database:\n{CORPUS_LIST}")
     elif decision == "SQL_ONLY" or not pricing_queue:
-        # FIX: Increased limit from 5 to 20 to cast a wider net for price sorting!
-        sql_res = sql_filter(filters, "sql", limit=20)
+        sql_res = sql_filter(filters, "sql", limit=30)
         context_blocks.append(format_sql_context(sql_res))
         for cand in sql_res.get("candidates", []):
             pricing_queue.add(cand["id"])
@@ -203,13 +206,12 @@ async def process_chat(req: ChatRequest):
         has_filters = any(v for k, v in filters.items() if v is not None and k not in ["age", "sum_insured_inr", "zone"])
         search_ids = list(pricing_queue)
         if has_filters and not search_ids:
-            # FIX: Increased limit from 5 to 20 here as well!
-            sql_res = sql_filter(filters, "rag", limit=20)
+            sql_res = sql_filter(filters, "rag", limit=30)
             search_ids = [c["id"] for c in sql_res.get("candidates",[])]
             session["last_candidate_ids"] = search_ids
             for sid in search_ids: pricing_queue.add(sid)
         
-        # Only fetch RAG context for top 5 to save context window tokens
+        # Only fetch actual PDF text for top 5 to save tokens
         rag_text = build_rag_context(question, search_ids[:5], section_tags or None, conditions)
         context_blocks.append(rag_text)
 
@@ -221,7 +223,6 @@ async def process_chat(req: ChatRequest):
         
         calculated_quotes = []
         
-        # FIX: Define a thread-safe worker to calculate quotes instantly
         def fetch_quote(pid):
             try:
                 res = calculate_quote(pid, int(filters["age"]), requested_si=target_si, zone=target_zone)
@@ -232,9 +233,8 @@ async def process_chat(req: ChatRequest):
                 pass
             return None
 
-        # PARALLEL EXECUTION: This fixes the time-delay bug! 
-        # Fires 20 calculations at once instead of one by one.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+        # PARALLEL EXECUTION
+        with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = [executor.submit(fetch_quote, pid) for pid in list(pricing_queue)]
             for future in concurrent.futures.as_completed(futures):
                 res = future.result()
@@ -242,27 +242,34 @@ async def process_chat(req: ChatRequest):
                     calculated_quotes.append(res)
                 
         if calculated_quotes:
-            # FIX: Sort the massive list of successful quotes by price!
+            # Sort all returned quotes by cheapest price
             calculated_quotes.sort(key=lambda x: x["final_payable"])
-            
-            # NOW slice the absolute top 5 cheapest to send to UI
             top_quotes = calculated_quotes[:5]
             
+            # YIELD TO THE FRONTEND TO BUILD THE CARDS!
             yield f"data: {json.dumps({'type':'structured_quote', 'data': top_quotes})}\n\n"
             
+            # --- THE FIX: DYNAMICALLY INJECT ALL PRICES AND POLICIES INTO THE AI'S BRAIN ---
+            quote_text = "\n".join([f"- **{q['policy_id'].replace('_', ' ')}**: ₹{q['final_payable']:,.0f}/year" for q in top_quotes])
+            
             llm_note = (
-                f"SYSTEM NOTE: Successfully calculated and displayed {len(top_quotes)} quotes in the UI cards. "
-                f"The absolute cheapest is {top_quotes[0]['policy_id']}. "
-                f"DO NOT output pricing tables. The UI already shows them. Proceed to compare features directly."
+                f"## CALCULATED QUOTES (Top {len(top_quotes)} Cheapest)\n"
+                f"{quote_text}\n\n"
+                "SYSTEM NOTE: You MUST list these exact policies and their premium amounts in your text response. "
+                "Compare their key features (room rent, co-pay, waiting periods) to help the user choose."
             )
             context_blocks.insert(0, llm_note)
+            
         else:
             context_blocks.insert(0, (
                 "## SYSTEM PRICING ERROR\n"
-                f"No matching rows in DB for Age {filters['age']}. "
-                "Apologize to the user and state that you do not have exact premium data, but provide the feature analysis."
+                "You tried to calculate premiums, but the database returned no matching rows "
+                f"for Age {filters['age']}. "
+                "You MUST apologize to the user and state that you do not have the exact premium "
+                "data for these policies in your database right now, but provide the feature analysis below."
             ))
 
+    # Phase C: Final Synthesis Compilation
     yield f"data: {json.dumps({'type':'trace','text':'Synthesizing...'})}\n\n"
 
     system_content = SYSTEM_PROMPT.format(intent_description=intent_desc or req.message)
