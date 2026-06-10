@@ -205,7 +205,7 @@ async def process_chat(req: ChatRequest):
     if decision == "NO_RETRIEVAL":
         context_blocks.append(f"Available policies:\n{CORPUS_LIST}")
     elif decision == "SQL_ONLY" or not pricing_queue:
-        sql_res = sql_filter(filters, "sql", limit=30)
+        sql_res = sql_filter(filters, "sql", limit=100)
         context_blocks.append(format_sql_context(sql_res))
         for cand in sql_res.get("candidates", []): pricing_queue.add(cand["id"])
     elif decision == "FC":
@@ -214,7 +214,7 @@ async def process_chat(req: ChatRequest):
         has_filters = any(v for k, v in filters.items() if v is not None and k not in ["age", "sum_insured_inr", "zone"])
         search_ids = list(pricing_queue)
         if has_filters and not search_ids:
-            sql_res = sql_filter(filters, "rag", limit=30)
+            sql_res = sql_filter(filters, "rag", limit=100)
             search_ids = [c["id"] for c in sql_res.get("candidates",[])]
             for sid in search_ids: pricing_queue.add(sid)
         
