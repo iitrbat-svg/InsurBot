@@ -83,20 +83,18 @@ def sql_context_for_candidates(candidate_ids: list) -> str:
     if not candidate_ids: return ""
     policies = get_policies(candidate_ids[:8])
     if not policies: return ""
-    lines = ["## Policy Structured Data (from database)\n"]
+    lines = ["## Detailed Benchmark Data (for comparison)\n"]
     for p in policies:
         lines.append(f"### {p.get('insurer')} — {p.get('product_slug')}")
         for label, val in [
-            ("SI Range",                f"₹{p.get('si_min_lakhs')}L – ₹{p.get('si_max_lakhs')}L"),
             ("Room Rent",               p.get("room_rent_limit")),
-            ("Initial Waiting",         "30 days"),
-            ("PED Waiting",             f"{p.get('ped_waiting_months')} months" if p.get('ped_waiting_months') else None),
-            ("Specific Illness Waiting",f"{p.get('specific_illness_waiting')} months" if p.get('specific_illness_waiting') else None),
+            ("PED Waiting",             f"{p.get('ped_waiting_months')} months" if p.get('ped_waiting_months') else "Not specified"),
+            ("Specific Illness Waiting",f"{p.get('specific_illness_waiting')} months" if p.get('specific_illness_waiting') else "Not specified"),
             ("Co-payment",              f"{p.get('copayment_percent',0)}%"),
+            ("Restore Benefit",         p.get("restore_type") or ("Yes" if p.get("restore_benefit") else "No")),
             ("Maternity",               "Covered" if p.get("maternity_covered") else "Not covered"),
-            ("Restore",                 p.get("restore_type") or ("Yes" if p.get("restore_benefit") else "No")),
         ]:
-            if val and "None" not in str(val): lines.append(f"- **{label}**: {val}")
+            if val is not None: lines.append(f"- {label}: {val}")
         lines.append("")
     return "\n".join(lines)
 
@@ -138,27 +136,28 @@ def format_sql_context(result):
     if not candidates: return "No matching policies found for the given criteria."
     return f"System found {len(candidates)} matching policies in the catalog. Passing to the pricing engine."
 
-SYSTEM_PROMPT = """You are an expert Indian health insurance advisor with deep knowledge of IRDAI regulations and all major Indian health insurance products.
+# --- NEW PROMPT: FORCING A POLICY-BY-POLICY LIST ---
+SYSTEM_PROMPT = """You are an expert Indian health insurance advisor.
 
-Answer the user's question accurately based on the factual calculations, policy structures, and brochure text provided in the context.
+Answer accurately based on the factual calculations and detailed benchmark data provided in the context below.
 
 UNIVERSAL RULES (CRITICAL):
 1. NO RAW TABLES: The frontend DOES NOT support Markdown tables. NEVER output a table format (`|---|---|`).
-2. NO REDUNDANT LISTS: The UI already displays beautiful visual price cards for the top policies. DO NOT print a numbered list of the policies and their prices at the top of your response.
-3. EXPLICIT PRICING IN TEXT: Even though you shouldn't make a standalone list, you MUST weave the exact Rupee premium amounts into your feature comparison below so the user knows exactly what they are paying for.
-4. ADJUSTED SUM INSUREDS: If a requested cover amount was unavailable and the system quoted a nearby amount (e.g. 15L instead of 10L), explicitly tell the user about the adjustment.
-5. BE PUNCHY & VISUAL: You MUST structure your response using this exact format with emojis:
+2. EXPLICIT POLICY LISTING: You MUST dedicate a separate bullet point to EACH policy provided in the context. If there are 5 policies, you must list 5 bullet points. Do not group by features.
+3. EXPLICIT PRICING IN TEXT: You MUST include the exact Rupee premium amounts next to each policy name.
+4. COMPREHENSIVE FEATURES: For each policy, you must mention its specific Room Rent, PED Waiting Period, Restoration benefit, and Co-pay.
+
+**You MUST structure your response EXACTLY like this:**
 
 **🏆 Top Recommendation**
 [1-2 sentences picking the absolute best policy based on the balance of price, waiting periods, and room rent.]
 
-**⚖️ Feature Breakdown**
-* 🛏️ **Room Rent:** [Compare the room rent limits]
-* ⏳ **Waiting Periods:** [Compare the Initial, PED (Pre-Existing), and Specific Illness wait times]
-* 🔄 **Restoration/Refill:** [Compare restore benefits]
-* 💰 **Co-payment:** [Compare co-pay percentages or out-of-pocket costs]
-* 👶 **Maternity:** [Mention if maternity is covered]
-*(Note: You can skip a bullet point if the context has absolutely no data for it, but try to cover as many as possible).*
+**⚖️ Feature Breakdown (Policy by Policy)**
+* 🏥 **[Policy 1 Name]** (₹[Premium Amount]/year): [2-3 sentences detailing its specific Room Rent, PED Wait, Specific Illness Wait, Restoration, and Co-pay]
+* 🏥 **[Policy 2 Name]** (₹[Premium Amount]/year): [2-3 sentences detailing its specific Room Rent, PED Wait, Specific Illness Wait, Restoration, and Co-pay]
+* 🏥 **[Policy 3 Name]** (₹[Premium Amount]/year): [2-3 sentences detailing its specific Room Rent, PED Wait, Specific Illness Wait, Restoration, and Co-pay]
+* 🏥 **[Policy 4 Name]** (₹[Premium Amount]/year): [2-3 sentences detailing its specific Room Rent, PED Wait, Specific Illness Wait, Restoration, and Co-pay]
+* 🏥 **[Policy 5 Name]** (₹[Premium Amount]/year): [2-3 sentences detailing its specific Room Rent, PED Wait, Specific Illness Wait, Restoration, and Co-pay]
 
 **💡 Final Verdict**
 [A quick closing thought on how the user should decide based on their budget vs. features.]"""
