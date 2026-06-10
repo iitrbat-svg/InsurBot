@@ -1,4 +1,4 @@
-"""FastAPI Backend — Insurance Intel (with Pricing Engine, SQL fallback, and Error Trapping)"""
+"""FastAPI Backend — Insurance Intel (Agentic RAG with Deterministic Guardrails)"""
 import os, json, asyncio
 import concurrent.futures
 from dotenv import load_dotenv
@@ -46,151 +46,135 @@ class ChatRequest(BaseModel):
     message:    str
     session_id: str = "default"
 
+# ── LAYER 3: THE REASONING ENGINE (DETERMINISTIC LOGIC) ──────────────────────
+
+def detect_feature_gaps(top_policies, filters):
+    """Identifies dangerous gaps in policies based on the user's specific profile."""
+    warnings = []
+    age = filters.get("age", 30)
+    zone = str(filters.get("zone", "")).lower()
+    
+    for p in top_policies:
+        name = p.get("product_slug", p.get("id"))
+        
+        # 1. Senior Co-pay Gap
+        copay = p.get("copayment_percent", 0)
+        if age >= 60 and copay > 0:
+            warnings.append(f"⚠️ {name} has a mandatory {copay}% co-pay because the user is a senior citizen. This means out-of-pocket costs on every claim.")
+            
+        # 2. Metro City Room Rent Gap
+        rr_limit = str(p.get("room_rent_limit", "")).lower()
+        is_metro = any(z in zone for z in ["zone 1", "zone a", "metro", "tier 1", "delhi", "mumbai", "bangalore"])
+        if is_metro and rr_limit and "no limit" not in rr_limit and "single" not in rr_limit:
+            warnings.append(f"⚠️ {name} caps room rent at '{p.get('room_rent_limit')}'. In Metro cities, this will trigger proportionate deductions, causing massive out-of-pocket bills.")
+            
+    return warnings
+
+def build_dynamic_instructions(filters, warnings):
+    """Generates strict commands the LLM MUST follow for this specific query."""
+    instructions = []
+    
+    requested_si = filters.get("sum_insured_inr")
+    if requested_si:
+        instructions.append(f"MUST verify if the quoted SI matches the requested ₹{requested_si/100000:g}L. If it differs, disclose this approximation immediately.")
+        
+    if filters.get("conditions"):
+        instructions.append("MUST present a 'Fastest Coverage' track (shortest PED wait) vs a 'Budget' track. Add strict risk warnings to the budget track explaining conditions are NOT covered yet.")
+        
+    if warnings:
+        instructions.append("MUST surface the Feature Gap Warnings provided below to the user.")
+        
+    return instructions
+
+def sql_context_for_candidates(candidate_ids: list) -> str:
+    if not candidate_ids: return ""
+    policies = get_policies(candidate_ids[:8])
+    if not policies: return ""
+    lines = ["## Detailed Benchmark Data (for comparison)\n"]
+    for p in policies:
+        lines.append(f"### {p.get('insurer')} — {p.get('product_slug')}")
+        for label, val in [
+            ("Room Rent",               p.get("room_rent_limit")),
+            ("PED Waiting",             f"{p.get('ped_waiting_months')} months" if p.get('ped_waiting_months') is not None else "Not specified"),
+            ("Specific Illness Waiting",f"{p.get('specific_illness_waiting')} months" if p.get('specific_illness_waiting') is not None else "Not specified"),
+            ("Co-payment",              f"{p.get('copayment_percent',0)}%"),
+            ("Restore Benefit",         p.get("restore_type") or ("Yes" if p.get("restore_benefit") else "No")),
+            ("Maternity",               "Covered" if p.get("maternity_covered") else "Not covered"),
+        ]:
+            if val is not None: lines.append(f"- {label}: {val}")
+        lines.append("")
+    return "\n".join(lines)
+
 def expand_query(question: str, conditions: list) -> str:
     if not conditions: return question
     key, model = GEMINI_CANDIDATES[-1]
     try:
         llm  = ChatGoogleGenerativeAI(model=model, google_api_key=key, temperature=0, max_output_tokens=150)
         resp = llm.invoke([HumanMessage(content=
-            f"""For this Indian health insurance query, add 3-5 relevant medical/insurance synonyms
-and alternate terms that would appear in policy documents. Keep it concise.
-Output ONLY the expanded query, no explanation.
-
-Original: {question}
-Conditions mentioned: {', '.join(conditions)}
-
-Expanded query:""")])
+            f"""For this Indian health insurance query, add 3-5 relevant medical/insurance synonyms. Output ONLY the expanded query. Original: {question} Conditions: {', '.join(conditions)}""")])
         expanded = resp.content.strip()
         return expanded if expanded else question
-    except Exception:
-        return question
+    except Exception: return question
 
 def rerank_chunks(chunks: list, question: str) -> list:
     if not chunks: return chunks
     filtered = [c for c in chunks if c.get("similarity",0) >= 0.42]
-    if len(filtered) < 3:
-        filtered = sorted(chunks, key=lambda c: c.get("similarity",0), reverse=True)[:3]
+    if len(filtered) < 3: filtered = sorted(chunks, key=lambda c: c.get("similarity",0), reverse=True)[:3]
     seen, deduped = {}, []
     for c in filtered:
         key = f"{c.get('policy_id')}_{c.get('section_tag')}"
-        prev_sim = seen.get(key)
-        if prev_sim is None or abs(c.get("similarity",0) - prev_sim) > 0.05:
+        if seen.get(key) is None or abs(c.get("similarity",0) - seen.get(key)) > 0.05:
             deduped.append(c)
             seen[key] = c.get("similarity",0)
     return deduped
-
-def sql_context_for_candidates(candidate_ids: list) -> str:
-    if not candidate_ids: return ""
-    policies = get_policies(candidate_ids[:8])
-    if not policies: return ""
-    lines = ["## Policy Structured Data (from database)\n"]
-    for p in policies:
-        lines.append(f"### {p.get('insurer')} — {p.get('product_slug')}")
-        for label, val in [
-            ("SI Range",                f"₹{p.get('si_min_lakhs')}L – ₹{p.get('si_max_lakhs')}L"),
-            ("Room Rent",               p.get("room_rent_limit")),
-            ("Initial Waiting",         "30 days"),
-            ("PED Waiting",             f"{p.get('ped_waiting_months')} months" if p.get('ped_waiting_months') else "Not specified"),
-            ("Specific Illness Waiting",f"{p.get('specific_illness_waiting')} months" if p.get('specific_illness_waiting') else "Not specified"),
-            ("Co-payment",              f"{p.get('copayment_percent',0)}%"),
-            ("Maternity",               "Covered" if p.get("maternity_covered") else "Not covered"),
-            ("Restore",                 p.get("restore_type") or ("Yes" if p.get("restore_benefit") else "No")),
-        ]:
-            if val and "None" not in str(val): lines.append(f"- **{label}**: {val}")
-        lines.append("")
-    return "\n".join(lines)
-
-def rag_quality_ok(chunks: list) -> bool:
-    return sum(1 for c in chunks if c.get("similarity",0) >= 0.5) >= 2
 
 def build_rag_context(question, policy_ids, section_tags, conditions=None):
     expanded = expand_query(question, conditions or [])
     result = retrieve(expanded, policy_ids=policy_ids, section_tags=section_tags, top_k=10)
     chunks = rerank_chunks(result.get("chunks",[]), question)
     rag_text = format_chunks({"chunks":chunks}, max_chunks=6)
-    if not rag_quality_ok(chunks) and policy_ids:
-        sql_text = sql_context_for_candidates(policy_ids)
-        if sql_text: return sql_text + "\n\n## Additional Clause Details\n" + rag_text
     return rag_text
 
 def build_fc_context(policy_ids, question, conditions=None):
-    policies = get_policies(policy_ids)
     rag_text = build_rag_context(question, policy_ids, None, conditions)
-    lines    = ["## Policy Structured Data\n"]
-    for p in policies:
-        lines.append(f"### {p.get('insurer')} — {p.get('product_slug')}")
-        for label, val in [
-            ("SI Range",                f"₹{p.get('si_min_lakhs')}L–₹{p.get('si_max_lakhs')}L"),
-            ("Room Rent",               p.get("room_rent_limit")),
-            ("Initial Waiting",         "30 days"),
-            ("PED Waiting",             f"{p.get('ped_waiting_months')}m" if p.get('ped_waiting_months') else None),
-            ("Specific Illness Waiting",f"{p.get('specific_illness_waiting')}m" if p.get('specific_illness_waiting') else None),
-            ("Co-payment",              f"{p.get('copayment_percent',0)}%"),
-        ]:
-            if val and "None" not in str(val): lines.append(f"- **{label}**: {val}")
-        lines.append("")
-    lines += ["\n## Relevant Policy Clauses\n", rag_text]
-    return "\n".join(lines)
+    return sql_context_for_candidates(policy_ids) + "\n## Relevant Policy Clauses\n" + rag_text
 
 def format_sql_context(result):
     candidates = result.get("candidates",[])
-    if not candidates: return "No matching policies found for the given criteria."
+    if not candidates: return "No matching policies found."
     return f"System found {len(candidates)} matching policies in the catalog. Passing to the pricing engine."
 
-# --- THE ULTIMATE CONSULTATIVE PROMPT ---
+
+# --- THE ULTIMATE CONSULTATIVE PROMPT (BASE LAYER) ---
 SYSTEM_PROMPT = """You are "Medi-Advisor", an expert health insurance consultant for the Indian market. You work for a neutral comparison platform and have access to exact premium data and policy documents.
 
-Your role is that of a trusted human advisor — someone who deeply understands the user's situation, proactively bridges gaps in their knowledge, and gives nuanced recommendations. 
+Your role is that of a trusted human advisor. Do not act like a search engine. Interpret the data provided in the Dynamic Context Packet below and give nuanced, proactive recommendations.
 
----
-## SECTION 1: CORE REASONING & INTENT
-1. UNDERSTAND THE NEED: A question about premium is often about affordability. A question about PED coverage is about financial security.
-2. IDENTIFY THE UNASKED: If they only asked about premium but one plan has a 3-year PED wait, you MUST surface that.
-3. FEATURE GAP DETECTION: If a plan is missing a feature that matters for their specific profile, flag it.
-
----
-## SECTION 2: SUM INSURED (SI) & ZONE INTELLIGENCE
-1. NEAREST SI MATCHING: If a requested SI isn't exactly available, quote the nearest available slabs and explicitly tell the user why.
-2. ADEQUACY ADVISORY: If a requested SI is too low for a metro city or chronic condition, proactively flag it.
-3. ADJUSTED ZONES: Always inform the user if you are quoting Zone A (Metro) pricing by default.
-
----
-## SECTION 3: PRE-EXISTING DISEASE (PED) INTELLIGENCE
-1. PED-FIRST THINKING: If the user mentions Diabetes, BP, Asthma, Heart/Kidney issues, Obesity, or prior surgeries, PED wait times govern your advice.
-2. TWO-TRACK RECOMMENDATION: If the user has a PED, you MUST present two tracks:
-   - Track A (Immediate/Best Protection): Plans with Day 1 or 12-month PED coverage.
-   - Track B (Budget-Friendly): Cheaper plans with 2-4 year waits. Include a strict warning that the condition is NOT covered during this time.
-
----
-## SECTION 4: DATA INTEGRITY & TRANSPARENCY
-1. ALWAYS DISCLOSE APPROXIMATIONS: If you used a nearest age or SI bracket, state it.
-2. DO NOT HALLUCINATE: If the provided data doesn't contain a specific sub-limit, explicitly state: "I don't have the exact limit for this in my data."
-3. EXPLICIT PRICING: You MUST weave the exact calculated Rupee premium amounts into your text.
-
----
-## SECTION 5: STRICT FORMATTING RULES (CRITICAL)
+## STRICT FORMATTING RULES (CRITICAL)
 1. NO RAW TABLES: The frontend DOES NOT support Markdown tables. NEVER output a table format (`|---|---|`).
-2. BE PUNCHY & VISUAL: Avoid massive walls of text. Use bullet points and the exact emojis provided below.
-3. POLICY BY POLICY: Do not group by features. You must dedicate a bullet point to each policy.
+2. BE PUNCHY & VISUAL: Avoid massive walls of text. Use bullet points and emojis.
+3. EXPLICIT PRICING: You MUST weave the exact calculated Rupee premium amounts into your text next to the policy names.
 
 **You MUST structure your response EXACTLY like this:**
 
 **🏆 Top Recommendation & Strategy**
-[Declare the winner. If they have conditions, explain the Two-Track tradeoff clearly: "For immediate coverage on your diabetes, [Policy X] is best because of its short PED wait. However, if you are looking to save on premiums and can wait, [Policy Y] is a much cheaper alternative."]
+[Declare the winner. If instructed to present Two Tracks (Fastest Coverage vs Budget), explain the tradeoff clearly here.]
 
 **⚖️ Feature Breakdown (Policy by Policy)**
-* 🏥 **[Policy 1 Name]** (₹[Premium]/year): [Detail its Room Rent, PED Wait, Specific Illness Wait, Restoration, and Co-pay. Highlight gaps.]
-* 🏥 **[Policy 2 Name]** (₹[Premium]/year): [Detail features]
-*(List all policies provided in the data. Keep descriptions tight and highly relevant to the user's age/conditions).*
+* 🏥 **[Policy 1 Name]** (₹[Premium]/year): [Detail its Room Rent, PED Wait, Specific Illness Wait, Restoration, and Co-pay. Include any warnings from the Feature Gaps!]
+* 🏥 **[Policy 2 Name]** (₹[Premium]/year): [Detail features & warnings]
+*(Ensure every policy gets its own dedicated bullet point).*
 
 **💡 Advisor's Verdict**
-[A final, warm closing thought guiding their decision based on their specific profile.]"""
+[A final, warm closing thought guiding their decision.]"""
 
-# ── Upgraded Pipeline Orchestration ───────────────────────────────────────────
+
+# ── ORCHESTRATOR ────────────────────────────────────────────────────────────
 
 async def process_chat(req: ChatRequest):
     session = load_session(req.session_id)
 
+    # Layer 1: Intent Classifier
     router_result = route(req.message, summary=session["summary"], conversation_history=session["recent_messages"])
     router_result            = resolve_followup(router_result, session)
     router_result["filters"] = enrich_filters(router_result.get("filters",{}), session)
@@ -214,26 +198,16 @@ async def process_chat(req: ChatRequest):
         yield f"data: {json.dumps({'type':'answer','text':q})}\n\n"
         yield "data: [DONE]\n\n"; return
 
-    if router_result.get("_missing_from_corpus"):
-        names = router_result.get("not_in_corpus",[])
-        msg   = f"I don't have {', '.join(names)} in my database. Currently I cover: {', '.join(set(p['insurer'] for p in CORPUS))}."
-        session = add_turn(session, req.message, msg)
-        save_session(req.session_id, session)
-        yield f"data: {json.dumps({'type':'answer','text':msg})}\n\n"
-        yield "data: [DONE]\n\n"; return
-
     context_blocks = []
     pricing_queue  = set(policies or router_result.get("resolved_policy_ids", []))
 
-    # Phase A: Handle Structural Filtering & Catalog Discretion
+    # Layer 2: Parallel Data Fetch
     if decision == "NO_RETRIEVAL":
-        context_blocks.append(f"Available policies in database:\n{CORPUS_LIST}")
+        context_blocks.append(f"Available policies:\n{CORPUS_LIST}")
     elif decision == "SQL_ONLY" or not pricing_queue:
         sql_res = sql_filter(filters, "sql", limit=30)
         context_blocks.append(format_sql_context(sql_res))
-        for cand in sql_res.get("candidates", []):
-            pricing_queue.add(cand["id"])
-        session["last_candidate_ids"] = [c["id"] for c in sql_res.get("candidates",[])]
+        for cand in sql_res.get("candidates", []): pricing_queue.add(cand["id"])
     elif decision == "FC":
         context_blocks.append(build_fc_context(list(pricing_queue), question, conditions))
     else:
@@ -242,20 +216,17 @@ async def process_chat(req: ChatRequest):
         if has_filters and not search_ids:
             sql_res = sql_filter(filters, "rag", limit=30)
             search_ids = [c["id"] for c in sql_res.get("candidates",[])]
-            session["last_candidate_ids"] = search_ids
             for sid in search_ids: pricing_queue.add(sid)
         
-        # Only fetch actual PDF text for top 5 to save tokens
         rag_text = build_rag_context(question, search_ids[:5], section_tags or None, conditions)
         context_blocks.append(rag_text)
 
-    # --- TOP-UP FILTER ---
-    # Strip out Super Top-Up plans (like Extra Care) so they don't unfairly win the "cheapest" bracket unless specifically asked for
+    # Top-Up Filter
     user_msg_lower = req.message.lower()
     if "top up" not in user_msg_lower and "top-up" not in user_msg_lower and "extra care" not in user_msg_lower:
         pricing_queue = {pid for pid in pricing_queue if "extra_care" not in pid.lower()}
 
-    # Phase B: Intercept with the Premium Underwriting Engine
+    # Pricing Engine
     if filters.get("age") and pricing_queue:
         yield f"data: {json.dumps({'type':'trace','text':f'Calculating quotes in parallel for {len(pricing_queue)} policies...'})}\n\n"
         target_si = filters.get("sum_insured_inr") or 500000
@@ -269,64 +240,72 @@ async def process_chat(req: ChatRequest):
                 if res.get("status") == "success":
                     res["policy_id"] = pid
                     return res
-            except Exception:
-                pass
+            except Exception: pass
             return None
 
-        # PARALLEL EXECUTION
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = [executor.submit(fetch_quote, pid) for pid in list(pricing_queue)]
             for future in concurrent.futures.as_completed(futures):
                 res = future.result()
-                if res:
-                    calculated_quotes.append(res)
+                if res: calculated_quotes.append(res)
                 
         if calculated_quotes:
-            # Sort all returned quotes by cheapest price
             calculated_quotes.sort(key=lambda x: x["final_payable"])
-            top_quotes = calculated_quotes[:5]
             
-            # YIELD TO THE FRONTEND TO BUILD THE CARDS!
+            # --- THE DIVERSITY SLICER ---
+            if conditions:
+                all_ids = [q["policy_id"] for q in calculated_quotes]
+                full_policies = get_policies(all_ids)
+                ped_lookup = {p["id"]: (p.get("ped_waiting_months") if p.get("ped_waiting_months") is not None else 99) for p in full_policies}
+                
+                top_quotes = calculated_quotes[:3] # 3 Cheapest
+                remaining = [q for q in calculated_quotes if q not in top_quotes]
+                remaining.sort(key=lambda x: (ped_lookup.get(x["policy_id"], 99), x["final_payable"]))
+                
+                top_quotes.extend(remaining[:2]) # 2 Shortest PED waits
+                top_quotes.sort(key=lambda x: x["final_payable"])
+            else:
+                top_quotes = calculated_quotes[:5]
+            
             yield f"data: {json.dumps({'type':'structured_quote', 'data': top_quotes})}\n\n"
             
-            # --- NEW SMART FETCH: GET RICH BENCHMARKS ONLY FOR THE 5 WINNERS ---
+            # Layer 3: Execute Reasoning Engine
             top_ids = [q["policy_id"] for q in top_quotes]
-            rich_benchmarks = sql_context_for_candidates(top_ids)
+            full_winning_policies = get_policies(top_ids)
             
+            feature_warnings = detect_feature_gaps(full_winning_policies, filters)
+            dynamic_instructions = build_dynamic_instructions(filters, feature_warnings)
+            rich_benchmarks = sql_context_for_candidates(top_ids)
             quote_text = "\n".join([f"- **{q['policy_id'].replace('_', ' ')}**: ₹{q['final_payable']:,.0f}/year" for q in top_quotes])
             
-            llm_note = (
-                f"## FINAL CALCULATED QUOTES (Top {len(top_quotes)} Cheapest)\n"
+            # Layer 4: Context Builder Payload
+            llm_packet = (
+                "=========================================\n"
+                "🛡️ DYNAMIC CONTEXT PACKET FOR MEDI-ADVISOR\n"
+                "=========================================\n\n"
+                "## 1. CALCULATED PREMIUMS\n"
                 f"{quote_text}\n\n"
-                f"## DETAILED POLICY BENCHMARKS\n"
-                f"{rich_benchmarks}\n\n"
-                "SYSTEM NOTE: You MUST list the top policies and their premium amounts in your text response. "
-                "Use the 'Detailed Policy Benchmarks' above to compare their waiting periods (PED, Specific Illness), Restore benefits, and Room Rent limits. Apply the Two-Track recommendation strategy if pre-existing conditions are present."
+                f"{rich_benchmarks}\n"
+                "## 3. FEATURE GAP WARNINGS (SURFACE THESE!)\n"
+                f"{chr(10).join(['- ' + w for w in feature_warnings]) if feature_warnings else 'No critical feature gaps detected.'}\n\n"
+                "## 4. STRICT INSTRUCTIONS FOR THIS QUERY\n"
+                f"{chr(10).join(['- ' + i for i in dynamic_instructions]) if dynamic_instructions else 'Proceed with standard comparison.'}\n"
+                "========================================="
             )
-            context_blocks.insert(0, llm_note)
-            
+            context_blocks.insert(0, llm_packet)
         else:
-            context_blocks.insert(0, (
-                "## SYSTEM PRICING ERROR\n"
-                "You tried to calculate premiums, but the database returned no matching rows "
-                f"for Age {filters['age']}. "
-                "You MUST apologize to the user and state that you do not have the exact premium "
-                "data for these policies in your database right now, but provide the feature analysis below."
-            ))
+            context_blocks.insert(0, f"SYSTEM ERROR: No database rows matched for Age {filters['age']}. Apologize and provide benchmark analysis only.")
 
-    # Phase C: Final Synthesis Compilation
+    # Layer 5: LLM Synthesis
     yield f"data: {json.dumps({'type':'trace','text':'Synthesizing...'})}\n\n"
 
-    # --- THE FIX: APPENDING INTENT SAFELY USING STRING CONCATENATION ---
     system_content = SYSTEM_PROMPT + f"\n\nUSER'S SPECIFIC INTENT/QUERY: {intent_desc or req.message}"
-    
     user_content   = f"Question: {req.message}\n"
     profile        = {k:v for k,v in filters.items() if v is not None}
-    if profile:                user_content += f"User profile matrix: {json.dumps(profile)}\n"
-    if session.get("summary"):     user_content += f"Conversation historical state: {session['summary']}\n"
+    if profile: user_content += f"User profile matrix: {json.dumps(profile)}\n"
     
     final_context = "\n\n".join(context_blocks)
-    if final_context:          user_content += f"\nAssembled Context Layer:\n{final_context}"
+    if final_context: user_content += f"\nAssembled Context Layer:\n{final_context}"
 
     messages = [SystemMessage(content=system_content), HumanMessage(content=user_content)]
 
@@ -349,24 +328,20 @@ async def process_chat(req: ChatRequest):
         yield f"data: {json.dumps({'type':'error','text':f'All models failed: {last_err}'})}\n\n"
 
     session = add_turn(session, req.message, full_answer)
-    if should_summarize(session):
-        yield f"data: {json.dumps({'type':'trace','text':'Updating memory...'})}\n\n"
-        session["summary"] = summarize(session)
+    if should_summarize(session): session["summary"] = summarize(session)
     save_session(req.session_id, session)
 
     yield "data: [DONE]\n\n"
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    return StreamingResponse(process_chat(req), media_type="text/event-stream",
-                             headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+    return StreamingResponse(process_chat(req), media_type="text/event-stream", headers={"Cache-Control":"no-cache"})
 
 @app.get("/health")
 def health(): return {"status":"ok","policies":len(CORPUS)}
 
 @app.get("/policies")
-def list_policies():
-    return [{"id":p["id"],"insurer":p["insurer"],"slug":p["product_slug"]} for p in CORPUS]
+def list_policies(): return [{"id":p["id"],"insurer":p["insurer"],"slug":p["product_slug"]} for p in CORPUS]
 
 if __name__ == "__main__":
     import uvicorn
