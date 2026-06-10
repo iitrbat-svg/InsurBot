@@ -83,18 +83,20 @@ def sql_context_for_candidates(candidate_ids: list) -> str:
     if not candidate_ids: return ""
     policies = get_policies(candidate_ids[:8])
     if not policies: return ""
-    lines = ["## Detailed Benchmark Data (for comparison)\n"]
+    lines = ["## Policy Structured Data (from database)\n"]
     for p in policies:
         lines.append(f"### {p.get('insurer')} — {p.get('product_slug')}")
         for label, val in [
+            ("SI Range",                f"₹{p.get('si_min_lakhs')}L – ₹{p.get('si_max_lakhs')}L"),
             ("Room Rent",               p.get("room_rent_limit")),
+            ("Initial Waiting",         "30 days"),
             ("PED Waiting",             f"{p.get('ped_waiting_months')} months" if p.get('ped_waiting_months') else "Not specified"),
             ("Specific Illness Waiting",f"{p.get('specific_illness_waiting')} months" if p.get('specific_illness_waiting') else "Not specified"),
             ("Co-payment",              f"{p.get('copayment_percent',0)}%"),
-            ("Restore Benefit",         p.get("restore_type") or ("Yes" if p.get("restore_benefit") else "No")),
             ("Maternity",               "Covered" if p.get("maternity_covered") else "Not covered"),
+            ("Restore",                 p.get("restore_type") or ("Yes" if p.get("restore_benefit") else "No")),
         ]:
-            if val is not None: lines.append(f"- {label}: {val}")
+            if val and "None" not in str(val): lines.append(f"- **{label}**: {val}")
         lines.append("")
     return "\n".join(lines)
 
@@ -130,37 +132,59 @@ def build_fc_context(policy_ids, question, conditions=None):
     lines += ["\n## Relevant Policy Clauses\n", rag_text]
     return "\n".join(lines)
 
-# --- REWRITTEN TO AVOID SPAMMING THE LLM WITH 30 INCOMPLETE POLICIES ---
 def format_sql_context(result):
     candidates = result.get("candidates",[])
     if not candidates: return "No matching policies found for the given criteria."
     return f"System found {len(candidates)} matching policies in the catalog. Passing to the pricing engine."
 
-# --- NEW PROMPT: FORCING A POLICY-BY-POLICY LIST ---
-SYSTEM_PROMPT = """You are an expert Indian health insurance advisor.
+# --- THE ULTIMATE CONSULTATIVE PROMPT ---
+SYSTEM_PROMPT = """You are "Medi-Advisor", an expert health insurance consultant for the Indian market. You work for a neutral comparison platform and have access to exact premium data and policy documents.
 
-Answer accurately based on the factual calculations and detailed benchmark data provided in the context below.
+Your role is that of a trusted human advisor — someone who deeply understands the user's situation, proactively bridges gaps in their knowledge, and gives nuanced recommendations. 
 
-UNIVERSAL RULES (CRITICAL):
+---
+## SECTION 1: CORE REASONING & INTENT
+1. UNDERSTAND THE NEED: A question about premium is often about affordability. A question about PED coverage is about financial security.
+2. IDENTIFY THE UNASKED: If they only asked about premium but one plan has a 3-year PED wait, you MUST surface that.
+3. FEATURE GAP DETECTION: If a plan is missing a feature that matters for their specific profile, flag it.
+
+---
+## SECTION 2: SUM INSURED (SI) & ZONE INTELLIGENCE
+1. NEAREST SI MATCHING: If a requested SI isn't exactly available, quote the nearest available slabs and explicitly tell the user why.
+2. ADEQUACY ADVISORY: If a requested SI is too low for a metro city or chronic condition, proactively flag it.
+3. ADJUSTED ZONES: Always inform the user if you are quoting Zone A (Metro) pricing by default.
+
+---
+## SECTION 3: PRE-EXISTING DISEASE (PED) INTELLIGENCE
+1. PED-FIRST THINKING: If the user mentions Diabetes, BP, Asthma, Heart/Kidney issues, Obesity, or prior surgeries, PED wait times govern your advice.
+2. TWO-TRACK RECOMMENDATION: If the user has a PED, you MUST present two tracks:
+   - Track A (Immediate/Best Protection): Plans with Day 1 or 12-month PED coverage.
+   - Track B (Budget-Friendly): Cheaper plans with 2-4 year waits. Include a strict warning that the condition is NOT covered during this time.
+
+---
+## SECTION 4: DATA INTEGRITY & TRANSPARENCY
+1. ALWAYS DISCLOSE APPROXIMATIONS: If you used a nearest age or SI bracket, state it.
+2. DO NOT HALLUCINATE: If the provided data doesn't contain a specific sub-limit, explicitly state: "I don't have the exact limit for this in my data."
+3. EXPLICIT PRICING: You MUST weave the exact calculated Rupee premium amounts into your text.
+
+---
+## SECTION 5: STRICT FORMATTING RULES (CRITICAL)
 1. NO RAW TABLES: The frontend DOES NOT support Markdown tables. NEVER output a table format (`|---|---|`).
-2. EXPLICIT POLICY LISTING: You MUST dedicate a separate bullet point to EACH policy provided in the context. If there are 5 policies, you must list 5 bullet points. Do not group by features.
-3. EXPLICIT PRICING IN TEXT: You MUST include the exact Rupee premium amounts next to each policy name.
-4. COMPREHENSIVE FEATURES: For each policy, you must mention its specific Room Rent, PED Waiting Period, Restoration benefit, and Co-pay.
+2. BE PUNCHY & VISUAL: Avoid massive walls of text. Use bullet points and the exact emojis provided below.
+3. POLICY BY POLICY: Do not group by features. You must dedicate a bullet point to each policy.
 
 **You MUST structure your response EXACTLY like this:**
 
-**🏆 Top Recommendation**
-[1-2 sentences picking the absolute best policy based on the balance of price, waiting periods, and room rent.]
+**🏆 Top Recommendation & Strategy**
+[Declare the winner. If they have conditions, explain the Two-Track tradeoff clearly: "For immediate coverage on your diabetes, [Policy X] is best because of its short PED wait. However, if you are looking to save on premiums and can wait, [Policy Y] is a much cheaper alternative."]
 
 **⚖️ Feature Breakdown (Policy by Policy)**
-* 🏥 **[Policy 1 Name]** (₹[Premium Amount]/year): [2-3 sentences detailing its specific Room Rent, PED Wait, Specific Illness Wait, Restoration, and Co-pay]
-* 🏥 **[Policy 2 Name]** (₹[Premium Amount]/year): [2-3 sentences detailing its specific Room Rent, PED Wait, Specific Illness Wait, Restoration, and Co-pay]
-* 🏥 **[Policy 3 Name]** (₹[Premium Amount]/year): [2-3 sentences detailing its specific Room Rent, PED Wait, Specific Illness Wait, Restoration, and Co-pay]
-* 🏥 **[Policy 4 Name]** (₹[Premium Amount]/year): [2-3 sentences detailing its specific Room Rent, PED Wait, Specific Illness Wait, Restoration, and Co-pay]
-* 🏥 **[Policy 5 Name]** (₹[Premium Amount]/year): [2-3 sentences detailing its specific Room Rent, PED Wait, Specific Illness Wait, Restoration, and Co-pay]
+* 🏥 **[Policy 1 Name]** (₹[Premium]/year): [Detail its Room Rent, PED Wait, Specific Illness Wait, Restoration, and Co-pay. Highlight gaps.]
+* 🏥 **[Policy 2 Name]** (₹[Premium]/year): [Detail features]
+*(List all policies provided in the data. Keep descriptions tight and highly relevant to the user's age/conditions).*
 
-**💡 Final Verdict**
-[A quick closing thought on how the user should decide based on their budget vs. features.]"""
+**💡 Advisor's Verdict**
+[A final, warm closing thought guiding their decision based on their specific profile.]"""
 
 # ── Upgraded Pipeline Orchestration ───────────────────────────────────────────
 
@@ -225,6 +249,12 @@ async def process_chat(req: ChatRequest):
         rag_text = build_rag_context(question, search_ids[:5], section_tags or None, conditions)
         context_blocks.append(rag_text)
 
+    # --- TOP-UP FILTER ---
+    # Strip out Super Top-Up plans (like Extra Care) so they don't unfairly win the "cheapest" bracket unless specifically asked for
+    user_msg_lower = req.message.lower()
+    if "top up" not in user_msg_lower and "top-up" not in user_msg_lower and "extra care" not in user_msg_lower:
+        pricing_queue = {pid for pid in pricing_queue if "extra_care" not in pid.lower()}
+
     # Phase B: Intercept with the Premium Underwriting Engine
     if filters.get("age") and pricing_queue:
         yield f"data: {json.dumps({'type':'trace','text':f'Calculating quotes in parallel for {len(pricing_queue)} policies...'})}\n\n"
@@ -271,7 +301,7 @@ async def process_chat(req: ChatRequest):
                 f"## DETAILED POLICY BENCHMARKS\n"
                 f"{rich_benchmarks}\n\n"
                 "SYSTEM NOTE: You MUST list the top policies and their premium amounts in your text response. "
-                "Use the 'Detailed Policy Benchmarks' above to compare their waiting periods (PED, Specific Illness), Restore benefits, and Room Rent limits. Do not just rely on room rent!"
+                "Use the 'Detailed Policy Benchmarks' above to compare their waiting periods (PED, Specific Illness), Restore benefits, and Room Rent limits. Apply the Two-Track recommendation strategy if pre-existing conditions are present."
             )
             context_blocks.insert(0, llm_note)
             
@@ -287,7 +317,9 @@ async def process_chat(req: ChatRequest):
     # Phase C: Final Synthesis Compilation
     yield f"data: {json.dumps({'type':'trace','text':'Synthesizing...'})}\n\n"
 
-    system_content = SYSTEM_PROMPT.format(intent_description=intent_desc or req.message)
+    # --- THE FIX: APPENDING INTENT SAFELY USING STRING CONCATENATION ---
+    system_content = SYSTEM_PROMPT + f"\n\nUSER'S SPECIFIC INTENT/QUERY: {intent_desc or req.message}"
+    
     user_content   = f"Question: {req.message}\n"
     profile        = {k:v for k,v in filters.items() if v is not None}
     if profile:                user_content += f"User profile matrix: {json.dumps(profile)}\n"
