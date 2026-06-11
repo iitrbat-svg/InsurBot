@@ -1,6 +1,5 @@
 """FastAPI Backend — Insurance Intel (Agentic RAG with Deterministic Guardrails)"""
 import os, json, asyncio, re
-import concurrent.futures
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,8 +27,8 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
 GEMINI_CANDIDATES = [(k,m) for k,m in [
-    (os.getenv("GEMINI_KEY_PAID1"),"gemini-2.5-flash"),
-    (os.getenv("GEMINI_KEY_PAID1"),"gemini-2.5-flash-lite"),
+    (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash"),
+    (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash-lite"),
     (os.getenv("GEMINI_KEY_1"),   "gemini-2.5-flash-lite"),
     (os.getenv("GEMINI_KEY_1"),   "gemini-2.0-flash"),
     (os.getenv("GEMINI_KEY_2"),   "gemini-2.5-flash-lite"),
@@ -49,20 +48,16 @@ class ChatRequest(BaseModel):
 # ── LAYER 3: THE REASONING ENGINE (DETERMINISTIC LOGIC) ──────────────────────
 
 def detect_feature_gaps(top_policies, filters):
-    """Identifies dangerous gaps in policies based on the user's specific profile."""
     warnings = []
     age = filters.get("age", 30)
     zone = str(filters.get("zone", "")).lower()
     
     for p in top_policies:
         name = p.get("product_slug", p.get("id"))
-        
-        # 1. Senior Co-pay Gap
         copay = p.get("copayment_percent", 0)
         if age >= 60 and copay > 0:
             warnings.append(f"⚠️ {name} has a mandatory {copay}% co-pay because the user is a senior citizen. This means out-of-pocket costs on every claim.")
             
-        # 2. Metro City Room Rent Gap
         rr_limit = str(p.get("room_rent_limit", "")).lower()
         is_metro = any(z in zone for z in ["zone 1", "zone a", "metro", "tier 1", "delhi", "mumbai", "bangalore"])
         if is_metro and rr_limit and "no limit" not in rr_limit and "single" not in rr_limit:
@@ -71,9 +66,7 @@ def detect_feature_gaps(top_policies, filters):
     return warnings
 
 def build_dynamic_instructions(filters, warnings):
-    """Generates strict commands the LLM MUST follow for this specific query."""
     instructions = []
-    
     requested_si = filters.get("sum_insured_inr")
     if requested_si:
         instructions.append(f"MUST verify if the quoted SI matches the requested ₹{requested_si/100000:g}L. If it differs, disclose this approximation immediately.")
@@ -144,7 +137,6 @@ def format_sql_context(result):
     if not candidates: return "No matching policies found."
     return f"System found {len(candidates)} matching policies in the catalog. Passing to the pricing engine."
 
-# --- THE ULTIMATE CONSULTATIVE PROMPT (BASE LAYER) ---
 SYSTEM_PROMPT = """You are "Medi-Advisor", an expert health insurance consultant for the Indian market. You work for a neutral comparison platform and have access to exact premium data and policy documents.
 
 Your role is that of a trusted human advisor. Do not act like a search engine. Interpret the data provided in the Dynamic Context Packet below and give nuanced, proactive recommendations.
@@ -173,7 +165,6 @@ Your role is that of a trusted human advisor. Do not act like a search engine. I
 async def process_chat(req: ChatRequest):
     session = load_session(req.session_id)
 
-    # Layer 1: Intent Classifier
     router_result = route(req.message, summary=session["summary"], conversation_history=session["recent_messages"])
     router_result            = resolve_followup(router_result, session)
     router_result["filters"] = enrich_filters(router_result.get("filters",{}), session)
@@ -208,7 +199,6 @@ async def process_chat(req: ChatRequest):
     context_blocks = []
     pricing_queue  = set(policies or router_result.get("resolved_policy_ids", []))
 
-    # Layer 2: Parallel Data Fetch (LIMIT INCREASED TO 100)
     if decision == "NO_RETRIEVAL":
         context_blocks.append(f"Available policies:\n{CORPUS_LIST}")
     elif decision == "SQL_ONLY" or not pricing_queue:
@@ -228,17 +218,15 @@ async def process_chat(req: ChatRequest):
         rag_text = build_rag_context(question, search_ids[:5], section_tags or None, conditions)
         context_blocks.append(rag_text)
 
-    # Top-Up Filter
     user_msg_lower = req.message.lower()
     if "top up" not in user_msg_lower and "top-up" not in user_msg_lower and "extra care" not in user_msg_lower:
         pricing_queue = {pid for pid in pricing_queue if "extra_care" not in pid.lower()}
 
-    # Pricing Engine
     if filters.get("age") and pricing_queue:
-        yield f"data: {json.dumps({'type':'trace','text':f'Calculating quotes in parallel for {len(pricing_queue)} policies...'})}\n\n"
+        yield f"data: {json.dumps({'type':'trace','text':f'Calculating quotes for {len(pricing_queue)} policies...'})}\n\n"
+        
         target_si = filters.get("sum_insured_inr") or 500000
         target_zone = filters.get("zone") or "All"
-        
         calculated_quotes = []
         
         def fetch_quote(pid):
@@ -250,38 +238,35 @@ async def process_chat(req: ChatRequest):
             except Exception: pass
             return None
 
-        # TRAFFIC CONTROL: Process max 8 policies at a time to prevent database lockups
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(fetch_quote, pid) for pid in list(pricing_queue)]
-            
-            # STRICT TIMEOUT: If the DB hangs for more than 15 seconds, skip and move on
-            for future in concurrent.futures.as_completed(futures, timeout=15):
-                try:
-                    res = future.result(timeout=5)
-                    if res: calculated_quotes.append(res)
-                except concurrent.futures.TimeoutError:
-                    print("DEBUG: A pricing thread timed out to save the app from hanging.")
-                    continue
-                except Exception as e:
-                    print(f"DEBUG: Pricing thread failed: {e}")
-                    continue
+        # --- NATIVE ASYNC BATCHING (Unblocks FastAPI!) ---
+        async def safe_fetch(pid):
+            loop = asyncio.get_running_loop()
+            try:
+                return await asyncio.wait_for(loop.run_in_executor(None, fetch_quote, pid), timeout=5.0)
+            except Exception as e:
+                print(f"DEBUG: Pricing thread failed or timed out for {pid}: {e}")
+                return None
+
+        # Process in batches of 8 so Supabase doesn't lock up
+        queue_list = list(pricing_queue)
+        for i in range(0, len(queue_list), 8):
+            batch = queue_list[i : i + 8]
+            results = await asyncio.gather(*(safe_fetch(pid) for pid in batch))
+            for r in results:
+                if r: calculated_quotes.append(r)
                 
         if calculated_quotes:
             calculated_quotes.sort(key=lambda x: x["final_payable"])
             
-            # --- THE DIVERSITY SLICER ---
-            # ULTRA-ROBUST TRIGGER: Don't just rely on the router. Check the raw text too!
             ped_keywords = ["diabetes", "bp", "blood pressure", "asthma", "waiting", "ped", "pre-existing", "disease", "day 0", "day 1"]
             needs_ped_sort = bool(conditions or any(k in user_msg_lower for k in ped_keywords))
             
-            # Server Terminal Debugging
             print(f"DEBUG: Priced {len(calculated_quotes)} policies for Age {filters.get('age')}. PED Sort Active: {needs_ped_sort}")
             
             if needs_ped_sort:
                 all_ids = [q["policy_id"] for q in calculated_quotes]
                 full_policies = get_policies(all_ids)
                 
-                # Ultra-Robust PED parser
                 def get_ped_val(val):
                     if val is None: return 99
                     val_str = str(val).lower().strip()
@@ -292,20 +277,17 @@ async def process_chat(req: ChatRequest):
 
                 ped_lookup = {p["id"]: get_ped_val(p.get("ped_waiting_months")) for p in full_policies}
                 
-                top_quotes = calculated_quotes[:3] # 3 Cheapest
+                top_quotes = calculated_quotes[:3] 
                 remaining = [q for q in calculated_quotes if q not in top_quotes]
-                
-                # Sort remaining by PED Wait (lowest first), then by price
                 remaining.sort(key=lambda x: (ped_lookup.get(x["policy_id"], 99), x["final_payable"]))
                 
-                top_quotes.extend(remaining[:2]) # 2 Shortest PED waits
+                top_quotes.extend(remaining[:2]) 
                 top_quotes.sort(key=lambda x: x["final_payable"])
             else:
                 top_quotes = calculated_quotes[:5]
             
             yield f"data: {json.dumps({'type':'structured_quote', 'data': top_quotes})}\n\n"
             
-            # Layer 3: Execute Reasoning Engine
             top_ids = [q["policy_id"] for q in top_quotes]
             full_winning_policies = get_policies(top_ids)
             
@@ -314,7 +296,6 @@ async def process_chat(req: ChatRequest):
             rich_benchmarks = sql_context_for_candidates(top_ids)
             quote_text = "\n".join([f"- **{q['policy_id'].replace('_', ' ')}**: ₹{q['final_payable']:,.0f}/year" for q in top_quotes])
             
-            # Layer 4: Context Builder Payload
             llm_packet = (
                 "=========================================\n"
                 "🛡️ DYNAMIC CONTEXT PACKET FOR MEDI-ADVISOR\n"
@@ -332,7 +313,6 @@ async def process_chat(req: ChatRequest):
         else:
             context_blocks.insert(0, f"SYSTEM ERROR: No database rows matched for Age {filters['age']}. Apologize and provide benchmark analysis only.")
 
-    # Layer 5: LLM Synthesis
     yield f"data: {json.dumps({'type':'trace','text':'Synthesizing...'})}\n\n"
 
     system_content = SYSTEM_PROMPT + f"\n\nUSER'S SPECIFIC INTENT/QUERY: {intent_desc or req.message}"
