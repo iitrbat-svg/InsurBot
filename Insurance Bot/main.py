@@ -28,8 +28,8 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
 GEMINI_CANDIDATES = [(k,m) for k,m in [
-    (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash"),
-    (os.getenv("GEMINI_KEY_PAID"),"gemini-2.5-flash-lite"),
+    (os.getenv("GEMINI_KEY_PAID1"),"gemini-2.5-flash"),
+    (os.getenv("GEMINI_KEY_PAID1"),"gemini-2.5-flash-lite"),
     (os.getenv("GEMINI_KEY_1"),   "gemini-2.5-flash-lite"),
     (os.getenv("GEMINI_KEY_1"),   "gemini-2.0-flash"),
     (os.getenv("GEMINI_KEY_2"),   "gemini-2.5-flash-lite"),
@@ -250,11 +250,21 @@ async def process_chat(req: ChatRequest):
             except Exception: pass
             return None
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
+        # TRAFFIC CONTROL: Process max 8 policies at a time to prevent database lockups
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             futures = [executor.submit(fetch_quote, pid) for pid in list(pricing_queue)]
-            for future in concurrent.futures.as_completed(futures):
-                res = future.result()
-                if res: calculated_quotes.append(res)
+            
+            # STRICT TIMEOUT: If the DB hangs for more than 15 seconds, skip and move on
+            for future in concurrent.futures.as_completed(futures, timeout=15):
+                try:
+                    res = future.result(timeout=5)
+                    if res: calculated_quotes.append(res)
+                except concurrent.futures.TimeoutError:
+                    print("DEBUG: A pricing thread timed out to save the app from hanging.")
+                    continue
+                except Exception as e:
+                    print(f"DEBUG: Pricing thread failed: {e}")
+                    continue
                 
         if calculated_quotes:
             calculated_quotes.sort(key=lambda x: x["final_payable"])
