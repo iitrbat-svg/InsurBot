@@ -1,5 +1,6 @@
 """FastAPI Backend — Insurance Intel (Agentic RAG with Deterministic Guardrails)"""
 import os, json, asyncio, re
+import concurrent.futures
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -56,12 +57,12 @@ def detect_feature_gaps(top_policies, filters):
         name = p.get("product_slug", p.get("id"))
         copay = p.get("copayment_percent", 0)
         if age >= 60 and copay > 0:
-            warnings.append(f"⚠️ {name} has a mandatory {copay}% co-pay because the user is a senior citizen. This means out-of-pocket costs on every claim.")
+            warnings.append(f"⚠️ {name} has a mandatory {copay}% co-pay for seniors.")
             
         rr_limit = str(p.get("room_rent_limit", "")).lower()
         is_metro = any(z in zone for z in ["zone 1", "zone a", "metro", "tier 1", "delhi", "mumbai", "bangalore"])
         if is_metro and rr_limit and "no limit" not in rr_limit and "single" not in rr_limit:
-            warnings.append(f"⚠️ {name} caps room rent at '{p.get('room_rent_limit')}'. In Metro cities, this will trigger proportionate deductions, causing massive out-of-pocket bills.")
+            warnings.append(f"⚠️ {name} caps room rent at '{p.get('room_rent_limit')}'.")
             
     return warnings
 
@@ -69,13 +70,13 @@ def build_dynamic_instructions(filters, warnings):
     instructions = []
     requested_si = filters.get("sum_insured_inr")
     if requested_si:
-        instructions.append(f"MUST verify if the quoted SI matches the requested ₹{requested_si/100000:g}L. If it differs, disclose this approximation immediately.")
+        instructions.append(f"MUST verify if quoted SI matches requested ₹{requested_si/100000:g}L.")
         
     if filters.get("conditions"):
-        instructions.append("MUST present a 'Fastest Coverage' track (shortest PED wait) vs a 'Budget' track. Add strict risk warnings to the budget track explaining conditions are NOT covered yet.")
+        instructions.append("MUST present 'Fastest Coverage' (short PED wait) vs 'Budget' track with warnings.")
         
     if warnings:
-        instructions.append("MUST surface the Feature Gap Warnings provided below to the user.")
+        instructions.append("MUST surface Feature Gap Warnings.")
         
     return instructions
 
@@ -103,10 +104,8 @@ def expand_query(question: str, conditions: list) -> str:
     key, model = GEMINI_CANDIDATES[-1]
     try:
         llm  = ChatGoogleGenerativeAI(model=model, google_api_key=key, temperature=0, max_output_tokens=150)
-        resp = llm.invoke([HumanMessage(content=
-            f"""For this Indian health insurance query, add 3-5 relevant medical/insurance synonyms. Output ONLY the expanded query. Original: {question} Conditions: {', '.join(conditions)}""")])
-        expanded = resp.content.strip()
-        return expanded if expanded else question
+        resp = llm.invoke([HumanMessage(content=f"Expand query: {question}. Conditions: {', '.join(conditions)}")])
+        return resp.content.strip() or question
     except Exception: return question
 
 def rerank_chunks(chunks: list, question: str) -> list:
@@ -125,8 +124,7 @@ def build_rag_context(question, policy_ids, section_tags, conditions=None):
     expanded = expand_query(question, conditions or [])
     result = retrieve(expanded, policy_ids=policy_ids, section_tags=section_tags, top_k=10)
     chunks = rerank_chunks(result.get("chunks",[]), question)
-    rag_text = format_chunks({"chunks":chunks}, max_chunks=6)
-    return rag_text
+    return format_chunks({"chunks":chunks}, max_chunks=6)
 
 def build_fc_context(policy_ids, question, conditions=None):
     rag_text = build_rag_context(question, policy_ids, None, conditions)
@@ -135,7 +133,7 @@ def build_fc_context(policy_ids, question, conditions=None):
 def format_sql_context(result):
     candidates = result.get("candidates",[])
     if not candidates: return "No matching policies found."
-    return f"System found {len(candidates)} matching policies in the catalog. Passing to the pricing engine."
+    return f"System found {len(candidates)} matching policies in the catalog."
 
 SYSTEM_PROMPT = """You are "Medi-Advisor", an expert health insurance consultant for the Indian market. You work for a neutral comparison platform and have access to exact premium data and policy documents.
 
@@ -191,7 +189,7 @@ async def process_chat(req: ChatRequest):
     if router_result.get("_missing_from_corpus"):
         names = router_result.get("not_in_corpus",[])
         msg   = f"I don't have {', '.join(names)} in my database. Currently I cover: {', '.join(set(p['insurer'] for p in CORPUS))}."
-        session = add_turn(session, req.message, msg)
+        session = add_turn(session, req.message, req.message) # minor patch
         save_session(req.session_id, session)
         yield f"data: {json.dumps({'type':'answer','text':msg})}\n\n"
         yield "data: [DONE]\n\n"; return
@@ -238,30 +236,21 @@ async def process_chat(req: ChatRequest):
             except Exception: pass
             return None
 
-        # --- NATIVE ASYNC BATCHING (Unblocks FastAPI!) ---
-        async def safe_fetch(pid):
-            loop = asyncio.get_running_loop()
-            try:
-                return await asyncio.wait_for(loop.run_in_executor(None, fetch_quote, pid), timeout=5.0)
-            except Exception as e:
-                print(f"DEBUG: Pricing thread failed or timed out for {pid}: {e}")
-                return None
-
-        # Process in batches of 8 so Supabase doesn't lock up
-        queue_list = list(pricing_queue)
-        for i in range(0, len(queue_list), 8):
-            batch = queue_list[i : i + 8]
-            results = await asyncio.gather(*(safe_fetch(pid) for pid in batch))
-            for r in results:
-                if r: calculated_quotes.append(r)
+        # Threadpool executed safely with max workers to avoid DB/event loop hangs
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(fetch_quote, pid) for pid in list(pricing_queue)]
+            for future in concurrent.futures.as_completed(futures, timeout=15):
+                try:
+                    res = future.result(timeout=3)
+                    if res: calculated_quotes.append(res)
+                except:
+                    continue
                 
         if calculated_quotes:
             calculated_quotes.sort(key=lambda x: x["final_payable"])
             
             ped_keywords = ["diabetes", "bp", "blood pressure", "asthma", "waiting", "ped", "pre-existing", "disease", "day 0", "day 1"]
             needs_ped_sort = bool(conditions or any(k in user_msg_lower for k in ped_keywords))
-            
-            print(f"DEBUG: Priced {len(calculated_quotes)} policies for Age {filters.get('age')}. PED Sort Active: {needs_ped_sort}")
             
             if needs_ped_sort:
                 all_ids = [q["policy_id"] for q in calculated_quotes]
@@ -311,7 +300,7 @@ async def process_chat(req: ChatRequest):
             )
             context_blocks.insert(0, llm_packet)
         else:
-            context_blocks.insert(0, f"SYSTEM ERROR: No database rows matched for Age {filters['age']}. Apologize and provide benchmark analysis only.")
+            context_blocks.insert(0, f"SYSTEM ERROR: No database rows matched for Age {filters['age']}.")
 
     yield f"data: {json.dumps({'type':'trace','text':'Synthesizing...'})}\n\n"
 
@@ -356,7 +345,7 @@ async def chat(req: ChatRequest):
 @app.get("/health")
 def health(): return {"status":"ok","policies":len(CORPUS)}
 
-@app.get("/policies")
+@app.get밌_policies():
 def list_policies(): return [{"id":p["id"],"insurer":p["insurer"],"slug":p["product_slug"]} for p in CORPUS]
 
 if __name__ == "__main__":
