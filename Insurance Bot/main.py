@@ -256,7 +256,12 @@ async def process_chat(req: ChatRequest):
             if conditions:
                 all_ids = [q["policy_id"] for q in calculated_quotes]
                 full_policies = get_policies(all_ids)
-                ped_lookup = {p["id"]: (p.get("ped_waiting_months") if p.get("ped_waiting_months") is not None else 99) for p in full_policies}
+                # --- BULLETPROOF PED LOOKUP ---
+                def get_ped_val(val):
+                    try: return int(val)
+                    except: return 99
+                
+                ped_lookup = {p["id"]: get_ped_val(p.get("ped_waiting_months")) for p in full_policies}
                 
                 top_quotes = calculated_quotes[:3] # 3 Cheapest
                 remaining = [q for q in calculated_quotes if q not in top_quotes]
