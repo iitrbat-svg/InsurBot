@@ -1,5 +1,5 @@
 """FastAPI Backend — Insurance Intel (Agentic RAG with Deterministic Guardrails)"""
-import os, json, asyncio, re
+import os, json, asyncio
 import concurrent.futures
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -144,6 +144,7 @@ def format_sql_context(result):
     if not candidates: return "No matching policies found."
     return f"System found {len(candidates)} matching policies in the catalog. Passing to the pricing engine."
 
+
 # --- THE ULTIMATE CONSULTATIVE PROMPT (BASE LAYER) ---
 SYSTEM_PROMPT = """You are "Medi-Advisor", an expert health insurance consultant for the Indian market. You work for a neutral comparison platform and have access to exact premium data and policy documents.
 
@@ -197,18 +198,10 @@ async def process_chat(req: ChatRequest):
         yield f"data: {json.dumps({'type':'answer','text':q})}\n\n"
         yield "data: [DONE]\n\n"; return
 
-    if router_result.get("_missing_from_corpus"):
-        names = router_result.get("not_in_corpus",[])
-        msg   = f"I don't have {', '.join(names)} in my database. Currently I cover: {', '.join(set(p['insurer'] for p in CORPUS))}."
-        session = add_turn(session, req.message, msg)
-        save_session(req.session_id, session)
-        yield f"data: {json.dumps({'type':'answer','text':msg})}\n\n"
-        yield "data: [DONE]\n\n"; return
-
     context_blocks = []
     pricing_queue  = set(policies or router_result.get("resolved_policy_ids", []))
 
-    # Layer 2: Parallel Data Fetch (LIMIT INCREASED TO 100)
+    # Layer 2: Parallel Data Fetch
     if decision == "NO_RETRIEVAL":
         context_blocks.append(f"Available policies:\n{CORPUS_LIST}")
     elif decision == "SQL_ONLY" or not pricing_queue:
@@ -263,22 +256,10 @@ async def process_chat(req: ChatRequest):
             if conditions:
                 all_ids = [q["policy_id"] for q in calculated_quotes]
                 full_policies = get_policies(all_ids)
-                
-                # Ultra-Robust PED parser
-                def get_ped_val(val):
-                    if val is None: return 99
-                    val_str = str(val).lower().strip()
-                    if "day 1" in val_str or "day 0" in val_str: return 0
-                    nums = re.findall(r'\d+', val_str)
-                    if nums: return int(nums[0])
-                    return 99
-
-                ped_lookup = {p["id"]: get_ped_val(p.get("ped_waiting_months")) for p in full_policies}
+                ped_lookup = {p["id"]: (p.get("ped_waiting_months") if p.get("ped_waiting_months") is not None else 99) for p in full_policies}
                 
                 top_quotes = calculated_quotes[:3] # 3 Cheapest
                 remaining = [q for q in calculated_quotes if q not in top_quotes]
-                
-                # Sort remaining by PED Wait (lowest first), then by price
                 remaining.sort(key=lambda x: (ped_lookup.get(x["policy_id"], 99), x["final_payable"]))
                 
                 top_quotes.extend(remaining[:2]) # 2 Shortest PED waits
