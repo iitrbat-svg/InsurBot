@@ -184,7 +184,7 @@ def enrich_filters(filters: dict, session: dict) -> dict:
     """
     profile  = session.get("user_profile", {})
     enriched = dict(filters)
-    for key in ["age","budget_yearly_inr","city_tier"]:
+    for key in ["age", "budget_yearly_inr", "city_tier", "sum_insured_inr", "zone"]:
         if enriched.get(key) is None and profile.get(key) is not None:
             enriched[key] = profile[key]
     # Merge conditions

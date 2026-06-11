@@ -101,12 +101,16 @@ def sql_context_for_candidates(candidate_ids: list) -> str:
 
 def expand_query(question: str, conditions: list) -> str:
     if not conditions: return question
-    key, model = GEMINI_CANDIDATES[-1]
-    try:
-        llm  = ChatGoogleGenerativeAI(model=model, google_api_key=key, temperature=0, max_output_tokens=150)
-        resp = llm.invoke([HumanMessage(content=f"Expand query: {question}. Conditions: {', '.join(conditions)}")])
-        return resp.content.strip() or question
-    except Exception: return question
+    prompt = (f"For this Indian health insurance query, add 3-5 relevant medical/insurance synonyms. "
+              f"Output ONLY the expanded query. Original: {question} Conditions: {', '.join(conditions)}")
+    for key, model in GEMINI_CANDIDATES:  # iterate best→worst, not [-1]
+        try:
+            llm  = ChatGoogleGenerativeAI(model=model, google_api_key=key, temperature=0, max_output_tokens=150)
+            resp = llm.invoke([HumanMessage(content=prompt)])
+            return resp.content.strip() or question
+        except Exception:
+            continue
+    return question
 
 def rerank_chunks(chunks: list, question: str) -> list:
     if not chunks: return chunks
@@ -189,10 +193,14 @@ async def process_chat(req: ChatRequest):
     if router_result.get("_missing_from_corpus"):
         names = router_result.get("not_in_corpus",[])
         msg   = f"I don't have {', '.join(names)} in my database. Currently I cover: {', '.join(set(p['insurer'] for p in CORPUS))}."
-        session = add_turn(session, req.message, req.message) # minor patch
+        session = add_turn(session, req.message, msg)
         save_session(req.session_id, session)
         yield f"data: {json.dumps({'type':'answer','text':msg})}\n\n"
         yield "data: [DONE]\n\n"; return
+
+    # Wire insurer_mentioned from router into filters so sql_filter can use p_insurer
+    if router_result.get("insurer_mentioned") and not filters.get("insurer"):
+        filters["insurer"] = router_result["insurer_mentioned"]
 
     context_blocks = []
     pricing_queue  = set(policies or router_result.get("resolved_policy_ids", []))
@@ -200,8 +208,9 @@ async def process_chat(req: ChatRequest):
     if decision == "NO_RETRIEVAL":
         context_blocks.append(f"Available policies:\n{CORPUS_LIST}")
     elif decision == "SQL_ONLY" or not pricing_queue:
+        # Run SQL to populate pricing_queue — the llm_packet built after pricing
+        # is what carries real data to the LLM; we do NOT need a placeholder here.
         sql_res = sql_filter(filters, "sql", limit=100)
-        context_blocks.append(format_sql_context(sql_res))
         for cand in sql_res.get("candidates", []): pricing_queue.add(cand["id"])
     elif decision == "FC":
         context_blocks.append(build_fc_context(list(pricing_queue), question, conditions))
@@ -213,7 +222,7 @@ async def process_chat(req: ChatRequest):
             search_ids = [c["id"] for c in sql_res.get("candidates",[])]
             for sid in search_ids: pricing_queue.add(sid)
         
-        rag_text = build_rag_context(question, search_ids[:5], section_tags or None, conditions)
+        rag_text = build_rag_context(question, search_ids[:12], section_tags or None, conditions)
         context_blocks.append(rag_text)
 
     user_msg_lower = req.message.lower()
@@ -266,8 +275,8 @@ async def process_chat(req: ChatRequest):
 
                 ped_lookup = {p["id"]: get_ped_val(p.get("ped_waiting_months")) for p in full_policies}
                 
-                top_quotes = calculated_quotes[:3] 
-                remaining = [q for q in calculated_quotes if q not in top_quotes]
+                top_quotes = calculated_quotes[:3]
+                remaining  = calculated_quotes[3:]  # index-based, never uses identity
                 remaining.sort(key=lambda x: (ped_lookup.get(x["policy_id"], 99), x["final_payable"]))
                 
                 top_quotes.extend(remaining[:2]) 
@@ -278,6 +287,7 @@ async def process_chat(req: ChatRequest):
             yield f"data: {json.dumps({'type':'structured_quote', 'data': top_quotes})}\n\n"
             
             top_ids = [q["policy_id"] for q in top_quotes]
+            session["last_candidate_ids"] = top_ids  # FIX: persist so follow-up queries resolve
             full_winning_policies = get_policies(top_ids)
             
             feature_warnings = detect_feature_gaps(full_winning_policies, filters)
@@ -291,8 +301,9 @@ async def process_chat(req: ChatRequest):
                 "=========================================\n\n"
                 "## 1. CALCULATED PREMIUMS\n"
                 f"{quote_text}\n\n"
+                "## 2. BENCHMARK DATA (Room Rent / PED Wait / Co-pay per policy)\n"
                 f"{rich_benchmarks}\n"
-                "## 3. FEATURE GAP WARNINGS (SURFACE THESE!)\n"
+                "## 3. FEATURE GAP WARNINGS (SURFACE THESE — mandatory!)\n"
                 f"{chr(10).join(['- ' + w for w in feature_warnings]) if feature_warnings else 'No critical feature gaps detected.'}\n\n"
                 "## 4. STRICT INSTRUCTIONS FOR THIS QUERY\n"
                 f"{chr(10).join(['- ' + i for i in dynamic_instructions]) if dynamic_instructions else 'Proceed with standard comparison.'}\n"
@@ -345,7 +356,7 @@ async def chat(req: ChatRequest):
 @app.get("/health")
 def health(): return {"status":"ok","policies":len(CORPUS)}
 
-@app.get밌_policies():
+@app.get("/policies")
 def list_policies(): return [{"id":p["id"],"insurer":p["insurer"],"slug":p["product_slug"]} for p in CORPUS]
 
 if __name__ == "__main__":
