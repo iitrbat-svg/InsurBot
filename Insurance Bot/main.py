@@ -260,7 +260,14 @@ async def process_chat(req: ChatRequest):
             calculated_quotes.sort(key=lambda x: x["final_payable"])
             
             # --- THE DIVERSITY SLICER ---
-            if conditions:
+            # ULTRA-ROBUST TRIGGER: Don't just rely on the router. Check the raw text too!
+            ped_keywords = ["diabetes", "bp", "blood pressure", "asthma", "waiting", "ped", "pre-existing", "disease", "day 0", "day 1"]
+            needs_ped_sort = bool(conditions or any(k in user_msg_lower for k in ped_keywords))
+            
+            # Server Terminal Debugging
+            print(f"DEBUG: Priced {len(calculated_quotes)} policies for Age {filters.get('age')}. PED Sort Active: {needs_ped_sort}")
+            
+            if needs_ped_sort:
                 all_ids = [q["policy_id"] for q in calculated_quotes]
                 full_policies = get_policies(all_ids)
                 
